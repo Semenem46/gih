@@ -1,21 +1,20 @@
 """
-discoverer_v2.py — расширение target_chats через парсинг публичных каталогов.
+discoverer_v2.py — расширение target_chats через DuckDuckGo + seed-файл.
 
-ВАЖНО: НЕ использует Telegram API / Telethon. Никаких сессий, никакого риска
-флуд-бана. Просто HTTP-запросы к публичным сайтам (как обычный браузер).
+ВАЖНО: НЕ использует Telegram API / Telethon. Только HTTP к публичным сайтам.
 
-Источники:
-  - tgstat.ru   (рейтинги по категориям)
-  - tgstat.ru/chats/<category>
-  - telega.in   (каталог чатов)
-  - кастомные URL через ENV TGSTAT_URLS
+Источники (в порядке надёжности):
+  1. chat_seeds.txt — твой ручной seed-файл с t.me ссылками (рекомендую)
+  2. DuckDuckGo Lite — поиск site:t.me "ищу подрядчика" и т.п. (~50 запросов)
+  3. Telega.in (резервно)
+  4. Кастомные URL через ENV TGSTAT_URLS
 
 Что делает:
-  1. Качает HTML страниц из SOURCES
+  1. Читает чаты из всех источников
   2. Регексом вытаскивает все t.me/<username>
   3. Применяет blacklist (работа/вакансии/etc)
   4. Дедуп против target_chats
-  5. Вставляет новые в target_chats со стандартным is_processed=0,
+  5. Вставляет новые со status is_processed=0,
      парсер постепенно начнёт их сканить (по 50 новых/день)
 
 Запуск:
@@ -24,8 +23,10 @@ discoverer_v2.py — расширение target_chats через парсинг
 
 ENV (опц.):
     APEX_DB=/path/to/apex_ai.db
-    TGSTAT_URLS="url1,url2,url3"   — добавить кастомные источники
-    DISCOVERER_LIMIT=2000          — макс новых чатов за прогон
+    SEED_FILE=/path/to/chat_seeds.txt
+    TGSTAT_URLS="url1,url2,url3"
+    DISCOVERER_LIMIT=2000
+    SKIP_DDG=1                      — пропустить DuckDuckGo
 """
 from __future__ import annotations
 
@@ -48,52 +49,89 @@ from blacklist import should_skip_chat
 #                  НАСТРОЙКИ
 # ============================================
 APEX_DB = os.environ.get("APEX_DB") or str(Path(__file__).resolve().parent / "apex_ai.db")
+SEED_FILE = os.environ.get("SEED_FILE") or str(Path(__file__).resolve().parent / "chat_seeds.txt")
 LIMIT = int(os.environ.get("DISCOVERER_LIMIT") or "2000")
 DELAY_BETWEEN = float(os.environ.get("DISCOVERER_DELAY") or "3.0")
+SKIP_DDG = bool(os.environ.get("SKIP_DDG"))
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Источники — категории из TGStat и Telega.in.
-DEFAULT_SOURCES = [
-    # ===== TGStat — основные тематики =====
-    ("TGStat / Бизнес и стартапы",         "https://tgstat.ru/business"),
-    ("TGStat / Бизнес-чаты",                "https://tgstat.ru/chats/business"),
-    ("TGStat / Маркетинг и PR",             "https://tgstat.ru/marketing-pr"),
-    ("TGStat / Маркетинг чаты",             "https://tgstat.ru/chats/marketing-pr"),
-    ("TGStat / Технологии",                 "https://tgstat.ru/tech"),
-    ("TGStat / Технологии чаты",            "https://tgstat.ru/chats/tech"),
-    ("TGStat / Образование",                "https://tgstat.ru/education"),
-    ("TGStat / Карьера",                    "https://tgstat.ru/career"),
-    ("TGStat / Экономика",                  "https://tgstat.ru/economics"),
-    ("TGStat / Продажи и e-com",            "https://tgstat.ru/sales"),
-    ("TGStat / Дизайн",                     "https://tgstat.ru/design"),
-    ("TGStat / Недвижимость",               "https://tgstat.ru/realty"),
-    ("TGStat / Право",                      "https://tgstat.ru/law"),
-    # ===== TGStat — регионы (где сидят владельцы малого бизнеса) =====
-    ("TGStat / Москва",                     "https://tgstat.ru/cities/moscow"),
-    ("TGStat / Санкт-Петербург",            "https://tgstat.ru/cities/spb"),
-    ("TGStat / Екатеринбург",               "https://tgstat.ru/cities/ekaterinburg"),
-    ("TGStat / Новосибирск",                "https://tgstat.ru/cities/novosibirsk"),
-    ("TGStat / Краснодар",                  "https://tgstat.ru/cities/krasnodar"),
-    ("TGStat / Казань",                     "https://tgstat.ru/cities/kazan"),
-    # ===== Telega.in — каталог =====
-    ("Telega.in / Бизнес",                  "https://telega.in/catalog/ru/business"),
-    ("Telega.in / Маркетинг",               "https://telega.in/catalog/ru/marketing"),
-    ("Telega.in / Технологии",              "https://telega.in/catalog/ru/technologies-and-internet"),
-    ("Telega.in / Экономика",               "https://telega.in/catalog/ru/economy"),
-    ("Telega.in / Образование",             "https://telega.in/catalog/ru/education-and-self-development"),
+# DuckDuckGo Lite — без JS и без Cloudflare. Принимает GET ?q=...
+DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+
+# Поисковые запросы — каждый даёт 10-30 t.me ссылок
+DDG_QUERIES = [
+    # Прямые интент-фразы (целевые лиды)
+    'site:t.me "ищу подрядчика"',
+    'site:t.me "нужен директолог"',
+    'site:t.me "ищем разработчика"',
+    'site:t.me "ищу маркетолога"',
+    'site:t.me "нужен seo"',
+    'site:t.me "посоветуйте подрядчика"',
+    'site:t.me "ищу команду"',
+    # B2B-чаты по нишам
+    'site:t.me "бизнес чат"',
+    'site:t.me "чат предпринимателей"',
+    'site:t.me "маркетинг чат"',
+    'site:t.me "стартап чат"',
+    'site:t.me "нетворкинг чат"',
+    'site:t.me "B2B чат"',
+    # Тематические
+    'site:t.me "разработка сайтов"',
+    'site:t.me "контекстная реклама"',
+    'site:t.me "продвижение сайта"',
+    'site:t.me "линкбилдинг"',
+    'site:t.me "трафик и реклама"',
+    'site:t.me "wildberries чат"',
+    'site:t.me "ozon селлеры"',
+    'site:t.me "маркетплейсы"',
+    'site:t.me "e-commerce чат"',
+    # Города
+    'site:t.me москва предприниматели',
+    'site:t.me спб бизнес чат',
+    'site:t.me екатеринбург бизнес',
+    'site:t.me новосибирск бизнес',
+    'site:t.me краснодар бизнес',
+    'site:t.me казань бизнес',
+    'site:t.me ростов бизнес',
+    'site:t.me челябинск бизнес',
+    'site:t.me пермь бизнес',
+    'site:t.me самара бизнес',
+    # Профессии заказчиков
+    'site:t.me "малый бизнес"',
+    'site:t.me "ИП и ООО"',
+    'site:t.me "франшизы чат"',
+    'site:t.me "ритейл"',
+    'site:t.me "строительный чат"',
+    'site:t.me "ремонт чат"',
+    'site:t.me "юристы для бизнеса"',
+    # Дополнительные тематики
+    'site:t.me "smm"',
+    'site:t.me "telegram реклама"',
+    'site:t.me "арбитраж трафика"',
+    'site:t.me "автоматизация бизнеса"',
+    'site:t.me "ai в бизнесе"',
+    'site:t.me "crm чат"',
 ]
 
-# Пользователь может добавить свои URL через ENV
+# Резервные источники (telega.in работает плохо, но пусть будет как запасной)
+FALLBACK_SOURCES = [
+    ("Telega.in / Бизнес",     "https://telega.in/catalog/ru/business"),
+    ("Telega.in / Маркетинг",  "https://telega.in/catalog/ru/marketing"),
+]
+
+# Пользовательские URL через ENV
 extra_urls = os.environ.get("TGSTAT_URLS", "").strip()
+CUSTOM_SOURCES = []
 if extra_urls:
     for i, u in enumerate(extra_urls.split(",")):
         u = u.strip()
         if u:
-            DEFAULT_SOURCES.append((f"CUSTOM-{i+1}", u))
+            CUSTOM_SOURCES.append((f"CUSTOM-{i+1}", u))
 
 
 # ============================================
@@ -117,15 +155,17 @@ TG_RESERVED = {
 # ============================================
 #            HTTP fetch
 # ============================================
-def fetch_html(url: str, timeout: int = 25) -> str | None:
+def fetch_html(url: str, timeout: int = 25, post_data: bytes | None = None) -> str | None:
     req = urllib.request.Request(
         url,
+        data=post_data,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive",
+            "Content-Type": "application/x-www-form-urlencoded" if post_data else "",
         },
     )
     try:
@@ -143,6 +183,61 @@ def fetch_html(url: str, timeout: int = 25) -> str | None:
     except Exception as e:
         print(f"    ⚠️  fetch error: {type(e).__name__}: {e}")
         return None
+
+
+def search_duckduckgo(query: str) -> str | None:
+    """Поиск через DuckDuckGo Lite (HTML, без JS и Cloudflare)."""
+    import urllib.parse as up
+    # Сначала пробуем lite (быстрее), если упадёт — html (более стабильный)
+    for url in (DDG_LITE_URL, DDG_HTML_URL):
+        # Лучше POST на lite, чтобы не словить редирект
+        post = up.urlencode({"q": query, "kl": "ru-ru"}).encode()
+        html = fetch_html(url, post_data=post)
+        if html and "t.me/" in html:
+            return html
+        # GET fallback
+        url_get = url + "?" + up.urlencode({"q": query, "kl": "ru-ru"})
+        html = fetch_html(url_get)
+        if html and "t.me/" in html:
+            return html
+    return None
+
+
+def load_seed_chats(path: str) -> list[str]:
+    """
+    Читает chat_seeds.txt — каждая строка это t.me ссылка / @username / просто username.
+    Строки с # игнорируются (комментарии).
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    chats: list[str] = []
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # извлекаем username из любого формата
+        m = T_ME_RE.search(line)
+        if m:
+            chats.append("@" + m.group(1).lower())
+            continue
+        if line.startswith("@"):
+            uname = line[1:].split()[0]
+            if 5 <= len(uname) <= 32 and uname.replace("_", "").isalnum():
+                chats.append("@" + uname.lower())
+            continue
+        # просто username без @
+        if 5 <= len(line) <= 32 and line.replace("_", "").isalnum():
+            chats.append("@" + line.lower())
+    # дедуп
+    seen = set()
+    out = []
+    for c in chats:
+        if c.lower() in seen:
+            continue
+        seen.add(c.lower())
+        out.append(c)
+    return out
 
 
 # ============================================
@@ -250,12 +345,12 @@ def insert_new_chats(chats: list[str], db_path: str, max_insert: int) -> dict:
 # ============================================
 def main() -> int:
     print("════════════════════════════════════════════════════════")
-    print("    Discoverer v2 — расширение базы чатов")
+    print("    Discoverer v2 — DuckDuckGo + seed + telega.in")
     print("════════════════════════════════════════════════════════")
     print(f"📂 БД:           {APEX_DB}")
-    print(f"📋 Источников:   {len(DEFAULT_SOURCES)}")
+    print(f"🌱 Seed-файл:    {SEED_FILE} {'(есть)' if Path(SEED_FILE).exists() else '(нет)'}")
+    print(f"🦆 DDG-запросов: {len(DDG_QUERIES) if not SKIP_DDG else 'SKIP'}")
     print(f"🛑 Лимит/прогон: {LIMIT}")
-    print(f"⏱  Пауза между:  {DELAY_BETWEEN}с")
     print()
 
     if not Path(APEX_DB).exists():
@@ -266,32 +361,79 @@ def main() -> int:
     seen: set[str] = set()
     source_stats: list[tuple[str, int, int]] = []
 
-    for i, (name, url) in enumerate(DEFAULT_SOURCES, start=1):
-        print(f"[{i}/{len(DEFAULT_SOURCES)}] 🌐 {name}")
-        print(f"    URL: {url}")
-        html = fetch_html(url)
-        if not html:
-            source_stats.append((name, 0, 0))
-            time.sleep(DELAY_BETWEEN)
+    # ── 1. Seed-файл (приоритет) ─────────────────────
+    print("─" * 56)
+    print("🌱 Этап 1: чтение seed-файла")
+    print("─" * 56)
+    seed_chats = load_seed_chats(SEED_FILE)
+    seed_added = 0
+    for c in seed_chats:
+        cl = c.lower()
+        if cl in seen:
             continue
+        seen.add(cl)
+        all_candidates.append(c)
+        seed_added += 1
+    print(f"  → {seed_added} чатов из seed-файла")
+    source_stats.append(("Seed-файл", seed_added, seed_added))
 
-        chats = extract_chats_from_html(html)
-        new_unique = 0
-        for c in chats:
-            cl = c.lower()
-            if cl in seen:
+    # ── 2. DuckDuckGo поиск ──────────────────────────
+    if not SKIP_DDG:
+        print()
+        print("─" * 56)
+        print("🦆 Этап 2: поиск через DuckDuckGo Lite")
+        print("─" * 56)
+        for i, q in enumerate(DDG_QUERIES, start=1):
+            print(f"  [{i:2d}/{len(DDG_QUERIES)}] q='{q[:55]}'", end=" ", flush=True)
+            html = search_duckduckgo(q)
+            if not html:
+                print("⚠️  no results")
+                source_stats.append((f"DDG: {q[:30]}", 0, 0))
+                time.sleep(DELAY_BETWEEN)
                 continue
-            seen.add(cl)
-            all_candidates.append(c)
-            new_unique += 1
+            chats = extract_chats_from_html(html)
+            new_unique = 0
+            for c in chats:
+                cl = c.lower()
+                if cl in seen:
+                    continue
+                seen.add(cl)
+                all_candidates.append(c)
+                new_unique += 1
+            print(f"→ найдено {len(chats):3d}, новых: {new_unique:3d}")
+            source_stats.append((f"DDG: {q[:30]}", len(chats), new_unique))
+            time.sleep(DELAY_BETWEEN)
 
-        source_stats.append((name, len(chats), new_unique))
-        print(f"    → найдено {len(chats)} t.me-ссылок, новых уник.: {new_unique}")
-        time.sleep(DELAY_BETWEEN)
+    # ── 3. Резервные источники + кастомные ───────────
+    fallback = FALLBACK_SOURCES + CUSTOM_SOURCES
+    if fallback:
+        print()
+        print("─" * 56)
+        print(f"🌐 Этап 3: резервные источники ({len(fallback)})")
+        print("─" * 56)
+        for name, url in fallback:
+            print(f"  {name}: {url}")
+            html = fetch_html(url)
+            if not html:
+                source_stats.append((name, 0, 0))
+                time.sleep(DELAY_BETWEEN)
+                continue
+            chats = extract_chats_from_html(html)
+            new_unique = 0
+            for c in chats:
+                cl = c.lower()
+                if cl in seen:
+                    continue
+                seen.add(cl)
+                all_candidates.append(c)
+                new_unique += 1
+            print(f"    → найдено {len(chats)}, новых: {new_unique}")
+            source_stats.append((name, len(chats), new_unique))
+            time.sleep(DELAY_BETWEEN)
 
     print()
     print(f"📦 Всего уникальных кандидатов: {len(all_candidates)}")
-    print(f"\n💾 Вставляю в БД (с blacklist + dedup, лимит={LIMIT})...")
+    print(f"\n💾 Вставляю в БД (blacklist + dedup, лимит={LIMIT})...")
     stats = insert_new_chats(all_candidates, APEX_DB, LIMIT)
 
     print()
@@ -304,13 +446,6 @@ def main() -> int:
     if stats["errors"]:
         print(f"⚠️  Ошибок INSERT:      {stats['errors']}")
 
-    print()
-    print("📊 По источникам:")
-    print(f"  {'Источник':<40} {'Найдено':>10} {'Уник':>10}")
-    print(f"  {'-'*40} {'-'*10:>10} {'-'*10:>10}")
-    for name, found, uniq in source_stats:
-        print(f"  {name:<40} {found:>10} {uniq:>10}")
-
     db = sqlite3.connect(APEX_DB)
     cur = db.cursor()
     cur.execute("SELECT COUNT(*) FROM target_chats")
@@ -319,7 +454,12 @@ def main() -> int:
     print()
     print(f"📈 Всего в target_chats сейчас: {total}")
     print()
-    print("✅ Готово. Парсер постепенно (по 50 новых/день) подхватит новые чаты.")
+
+    if stats["inserted"] == 0:
+        print("⚠️  Ничего не добавлено. Если DuckDuckGo тоже падает — заполни вручную")
+        print(f"   файл {SEED_FILE} (по одному t.me-username в строке) и перезапусти.")
+    else:
+        print("✅ Готово. Парсер постепенно (по 50 новых/день) подхватит новые чаты.")
     return 0
 
 
