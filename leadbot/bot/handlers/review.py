@@ -127,12 +127,12 @@ async def _qstats_full() -> dict:
                     COALESCE(pc.client_name, 'user_' || pr.client_user_id) AS name,
                     pr.client_user_id,
                     COALESCE(pc.mode, 'lead-finder') AS mode,
-                    SUM(CASE WHEN pr.status = 'ai_pending'  THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'ai_filtered' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'pending'     THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'sent'        THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'rejected'    THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'skipped'     THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN pr.status = 'ai_pending'  THEN 1 ELSE 0 END) AS ai_pending,
+                    SUM(CASE WHEN pr.status = 'ai_filtered' THEN 1 ELSE 0 END) AS ai_filtered,
+                    SUM(CASE WHEN pr.status = 'pending'     THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN pr.status = 'sent'        THEN 1 ELSE 0 END) AS sent,
+                    SUM(CASE WHEN pr.status = 'rejected'    THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN pr.status = 'skipped'     THEN 1 ELSE 0 END) AS skipped
                 FROM pending_review pr
                 LEFT JOIN paid_clients pc ON pc.user_id = pr.client_user_id
                 GROUP BY pr.client_user_id
@@ -146,12 +146,12 @@ async def _qstats_full() -> dict:
                     COALESCE(pc.client_name, 'user_' || pr.client_user_id) AS name,
                     pr.client_user_id,
                     'lead-finder' AS mode,
-                    SUM(CASE WHEN pr.status = 'ai_pending'  THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'ai_filtered' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'pending'     THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'sent'        THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'rejected'    THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pr.status = 'skipped'     THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN pr.status = 'ai_pending'  THEN 1 ELSE 0 END) AS ai_pending,
+                    SUM(CASE WHEN pr.status = 'ai_filtered' THEN 1 ELSE 0 END) AS ai_filtered,
+                    SUM(CASE WHEN pr.status = 'pending'     THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN pr.status = 'sent'        THEN 1 ELSE 0 END) AS sent,
+                    SUM(CASE WHEN pr.status = 'rejected'    THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN pr.status = 'skipped'     THEN 1 ELSE 0 END) AS skipped
                 FROM pending_review pr
                 LEFT JOIN paid_clients pc ON pc.user_id = pr.client_user_id
                 GROUP BY pr.client_user_id
