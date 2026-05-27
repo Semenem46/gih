@@ -32,6 +32,13 @@ except ImportError:  # на случай если запуск из другой
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from blacklist import should_skip_chat
 
+# Pre-AI текстовый фильтр (язык/hiring/intent) — экономит DeepSeek-токены
+try:
+    from query_engine import _passes_pre_ai_filter
+except ImportError:
+    def _passes_pre_ai_filter(text, min_cyrillic: float = 0.4):  # type: ignore
+        return True, ""
+
 
 # ==========================================
 # ⚙️ НАСТРОЙКИ
@@ -154,16 +161,31 @@ async def init_tables(db_path: str = APEX_DB) -> None:
 # 📋 АКТИВНЫЕ КЛИЕНТЫ
 # ==========================================
 async def get_active_clients(db_path: str = APEX_DB) -> list[dict]:
+    # mode может отсутствовать в старых БД — COALESCE'ом подставляем 'lead-finder'
     async with aiosqlite.connect(db_path) as db:
-        async with db.execute(
-            """
-            SELECT user_id, client_name, niche_text, niche_keywords, last_corpus_id, expires_at
-            FROM paid_clients
-            WHERE status = 'active'
-              AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-            """
-        ) as cur:
-            rows = await cur.fetchall()
+        try:
+            async with db.execute(
+                """
+                SELECT user_id, client_name, niche_text, niche_keywords, last_corpus_id,
+                       expires_at, COALESCE(mode, 'lead-finder') AS mode
+                FROM paid_clients
+                WHERE status = 'active'
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+        except aiosqlite.OperationalError:
+            # колонки mode нет — fallback на старую схему
+            async with db.execute(
+                """
+                SELECT user_id, client_name, niche_text, niche_keywords, last_corpus_id,
+                       expires_at
+                FROM paid_clients
+                WHERE status = 'active'
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                """
+            ) as cur:
+                rows = [list(r) + ['lead-finder'] for r in await cur.fetchall()]
     return [
         {
             "user_id": r[0],
@@ -172,6 +194,7 @@ async def get_active_clients(db_path: str = APEX_DB) -> list[dict]:
             "keywords": r[3],
             "last_id": r[4] or 0,
             "expires_at": r[5],
+            "mode": r[6] or "lead-finder",
         }
         for r in rows
     ]
@@ -239,7 +262,7 @@ async def scan_for_client(client: dict, db_path: str = APEX_DB) -> list[tuple[in
     async with aiosqlite.connect(db_path) as db:
         try:
             sql = """
-                SELECT mc.id, mc.chat_key
+                SELECT mc.id, mc.chat_key, mc.text
                 FROM messages_fts
                 JOIN messages_corpus mc ON mc.id = messages_fts.rowid
                 LEFT JOIN delivered_leads dl
@@ -267,7 +290,7 @@ async def scan_for_client(client: dict, db_path: str = APEX_DB) -> list[tuple[in
                 ),
             ) as cur:
                 rows = await cur.fetchall()
-                return [(r[0], r[1]) for r in rows]
+                return [(r[0], r[1], r[2]) for r in rows]
         except Exception as e:
             logger.warning(
                 f"FTS-query упал для {client['user_id']} ({client['name']}): {e} | q={fts_query!r}"
@@ -279,29 +302,44 @@ async def scan_for_client(client: dict, db_path: str = APEX_DB) -> list[tuple[in
 # 📥 ОЧЕРЕДЬ КАНДИДАТОВ (с blacklist + ai_pending)
 # ==========================================
 async def queue_candidates(
-    client_uid: int, candidates: list[tuple[int, str | None]], db_path: str = APEX_DB
+    client_uid: int,
+    candidates: list[tuple[int, str | None, str | None]],
+    db_path: str = APEX_DB,
+    client_mode: str = "lead-finder",
 ) -> tuple[int, int, int]:
     """
     Вставляет в pending_review со status='ai_pending'.
-    Применяет blacklist по chat_key.
-    Также сдвигает last_corpus_id (по всем виденным id, даже отбракованным
-    blacklist'ом — иначе они будут пересканиваться вечно).
+    Применяет:
+      - blacklist по chat_key (всегда)
+      - pre-AI текстовый фильтр intent/hiring/lang — ТОЛЬКО для mode=lead-finder.
+        В dm-outreach фильтр НЕ применяем: там ищем фрилансеров, которые
+        предлагают свои услуги ("делаю", "оказываю") — у них нет "ищу/нужен".
+    Также сдвигает last_corpus_id (по всем виденным id, даже отбракованным —
+    иначе они будут пересканиваться вечно).
 
     Возвращает: (inserted, blacklisted, max_id_seen)
     """
     if not candidates:
         return (0, 0, 0)
 
+    apply_text_filter = (client_mode == "lead-finder")
+
     inserted = 0
     blacklisted = 0
+    text_filtered = 0
     max_id = 0
     async with aiosqlite.connect(db_path) as db:
-        for cid, chat_key in candidates:
+        for cid, chat_key, text in candidates:
             if cid > max_id:
                 max_id = cid
             if should_skip_chat(chat_key):
                 blacklisted += 1
                 continue
+            if apply_text_filter:
+                passed, _reason = _passes_pre_ai_filter(text or "")
+                if not passed:
+                    text_filtered += 1
+                    continue
             try:
                 cur = await db.execute(
                     "INSERT OR IGNORE INTO pending_review "
@@ -318,6 +356,10 @@ async def queue_candidates(
                 (max_id, client_uid),
             )
         await db.commit()
+    if text_filtered:
+        logger.info(
+            f"  uid={client_uid} [{client_mode}]: pre-AI отфильтровано {text_filtered}"
+        )
     return (inserted, blacklisted, max_id)
 
 
@@ -363,7 +405,9 @@ async def main_loop() -> None:
                     cands = await scan_for_client(c)
                     if not cands:
                         continue
-                    ins, bl, max_id = await queue_candidates(c["user_id"], cands)
+                    ins, bl, max_id = await queue_candidates(
+                        c["user_id"], cands, client_mode=c.get("mode", "lead-finder")
+                    )
                     tick_inserted += ins
                     tick_blacklisted += bl
                     if ins > 0 or bl > 0:

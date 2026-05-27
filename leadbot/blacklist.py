@@ -68,6 +68,31 @@ BLACKLIST_PATTERNS = [
     r"_aukcion",
     r"\bbiding",
     r"buyguide",
+    # Биржи фриланса (заказчики через форму, контакты не отдают)
+    r"\bvpsmm",            # @vpsmm_marketing — биржа фриланса
+    r"_vpsmm",
+    r"\bbirzha",
+    r"_birzha",
+    r"birzh_",
+    r"\bfrilans",
+    r"\bfreelans",
+    r"freelance_b",
+    r"poisk_reklama",      # узбекские объявления о найме
+    r"_poisk_",            # @ru_poisk_*, @poisk_freelance — обычно агрегаторы
+    r"poisk_freelance",
+    # Узбекские/таджикские/киргизские мигрантские чаты (тексты на узб/тадж,
+    # русско-говорящих клиентов мало → много шума по найму в штат)
+    r"_uz_",
+    r"_tj_",
+    r"tashkent_rabot",
+    r"\buzb_",
+    r"uzbek_",
+    r"tajik_",
+    r"_migrant",
+    # Резюме / соискатели
+    r"resume_",
+    r"_resume",
+    r"\bcv_",
     # Аренда квартир / бытовуха не наша
     r"kvartira_ish",
     r"_obi",  # @mahachkala_obi и подобные «общаги»
@@ -119,6 +144,13 @@ if __name__ == "__main__":
         ("@biznesdvigkrd", False),
         ("@chatb2bnews", False),
         ("@novosibirsk_biz", False),
+        # Новые
+        ("@vpsmm_marketing", True),      # биржа фриланса
+        ("@poisk_reklama", True),        # узбекские объявления
+        ("@birzha_freelance", True),
+        ("@uzbek_jobs", True),
+        ("@tashkent_rabota", True),
+        ("@bizrf_chat", False),          # нормальный B2B чат
     ]
     print(f"{'chat':<40} {'expected':<10} {'actual':<10} {'ok':<5}")
     for chat, expected in test_cases:

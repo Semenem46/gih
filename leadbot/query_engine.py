@@ -85,10 +85,58 @@ GLOBAL_STOP_PHRASES = [
     "работа удалённо",
     "удаленка",  # часто в вакансиях
 ]
+
+# Маркеры запроса от первого лица (если хоть один есть в тексте — может быть лид).
+# Если НЕТ ни одного — сообщение почти точно НЕ запрос на услугу (отсекаем без AI).
+INTENT_MARKERS = [
+    # русский — запрос
+    "ищу", "ищем", "нужен", "нужна", "нужны", "нужно",
+    "посоветуйте", "посоветуете", "подскажите",
+    "хочу заказать", "хочу найти", "хочу нанять",
+    "кто может", "кто умеет", "кто делает", "кто возьм",
+    "возьму", "беру в работу", "примем", "приму",
+    "требуется", "требуются", "необходим", "необходима", "необходимо",
+    "интересует", "интересно",
+    "помогите", "помоги ",
+    "рекоменду", "порекоменду",
+    # вопросы с "?"
+    "?",
+]
+
+# Маркеры HIRING-постов (фирма ищет сотрудника в штат). Если есть хоть один —
+# почти точно вакансия, не запрос подрядчика. ОТСЕКАЕМ ДО AI.
+HIRING_MARKERS = [
+    # русский — найм
+    "в команду", "в нашу команду", "в нашу студию", "в наш отдел",
+    "ищем в команду", "ищем сотрудник", "в штат", "штатно",
+    "оформление по тк", "оформление тк", "официальное трудоустрой",
+    "официальная зп", "белая зарплата", "зарплата от",
+    "вилка зп", "вилка зарплат", "ставка от",
+    "пишите hr", "наш hr", "контакт hr",
+    "наш менеджер свяжется",
+    "присылайте резюме", "присылай резюме", "отправляйте резюме",
+    "резюме на почт", "cv на почт",
+    "график 5/2", "график 2/2", "график 5\\2", "сменный график",
+    "испытательный срок",
+    "от 40 000 руб", "от 50 000 руб", "от 60 000 руб",
+    "от 70 000 руб", "от 80 000 руб", "от 100 000",
+    "соцпакет",
+    # узбекский — найм («ищем», «требуется», «в команду»)
+    "кидирамиз", "кидирвомиз", "кидирилади", "кидирамыз",
+    "командага", "командаг", "командамиз",
+    "талаб килин", "талаб этил",
+    "иш буш", "иш хакки",
+    # английский
+    "we are hiring", "we're hiring", "looking to hire",
+    "join our team", "join the team", "send your cv", "send cv",
+    "send resume", "salary range", "monthly salary",
+]
+
       # минимальный score для показа клиенту
 DEFAULT_LIMIT = 10            # сколько лидов возвращать по умолчанию
 FTS_CANDIDATES = 150          # сколько кандидатов брать из FTS перед AI-фильтром
 LOOKBACK_DAYS = 30            # окно поиска (свежесть лидов)
+MIN_TEXT_LEN = 40             # короче — почти всегда мусор/стикер/реакция
 
 logger = logging.getLogger(__name__)
 ai_client = AsyncOpenAI(
@@ -97,6 +145,69 @@ ai_client = AsyncOpenAI(
     max_retries=0,
     timeout=45.0,
 )
+
+
+# ==========================================
+# 🛡️ Pre-AI фильтры (бесплатные регулярки до DeepSeek)
+# ==========================================
+_CYRILLIC_RX = re.compile(r"[\u0400-\u04FF]")
+_LETTERS_RX = re.compile(r"[a-zA-Zа-яА-Я\u0400-\u04FF]")
+_WORD_SPLIT_RX = re.compile(r"\W+", re.UNICODE)
+
+
+def _has_intent_markers(text: str) -> bool:
+    """True если есть маркер запроса от первого лица.
+    Дёшево — экономит DeepSeek-токены: если нет ни одного маркера, точно не лид."""
+    if not text:
+        return False
+    t = text.lower()
+    return any(m in t for m in INTENT_MARKERS)
+
+
+def _is_hiring_post(text: str) -> bool:
+    """True если сообщение похоже на найм-вакансию (фирма ищет сотрудника)."""
+    if not text:
+        return False
+    t = text.lower()
+    return any(m in t for m in HIRING_MARKERS)
+
+
+def _cyrillic_ratio(text: str) -> float:
+    """Доля кириллицы среди БУКВ (не всего текста — игнорируем эмодзи/пунктуацию).
+    1.0 = чисто русский, 0.0 = чисто латиница/арабский/китайский."""
+    if not text:
+        return 0.0
+    letters = _LETTERS_RX.findall(text)
+    if not letters:
+        return 0.0
+    cyrillic = sum(1 for ch in letters if _CYRILLIC_RX.match(ch))
+    return cyrillic / len(letters)
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Нормализует текст для дедупликации (lower + слова через пробел, без знаков).
+    Возвращает первые ~200 значимых символов — нормально для repost-detection."""
+    if not text:
+        return ""
+    words = [w for w in _WORD_SPLIT_RX.split(text.lower()) if w]
+    return " ".join(words)[:200]
+
+
+def _passes_pre_ai_filter(text: str, min_cyrillic: float = 0.4) -> tuple[bool, str]:
+    """Главный pre-AI фильтр.
+    Возвращает (passed, reject_reason). Если passed=False — не отдаём в AI.
+
+    Применяется ДО DeepSeek чтобы экономить токены и не пропускать очевидную чушь.
+    Не используется в `count_potential_leads` (там FTS-COUNT нужен честный)."""
+    if not text or len(text.strip()) < MIN_TEXT_LEN:
+        return False, "too_short"
+    if _cyrillic_ratio(text) < min_cyrillic:
+        return False, "non_cyrillic"
+    if _is_hiring_post(text):
+        return False, "hiring_post"
+    if not _has_intent_markers(text):
+        return False, "no_intent_marker"
+    return True, ""
 
 
 # ==========================================
@@ -268,11 +379,27 @@ async def qualify_message_for_niche(text: str, niche_info: dict) -> dict:
 
 ═══ ЖЁСТКО ОТКЛОНЯЙ (score 0-30) ═══
 
-❌ ВАКАНСИЯ / ОБЪЯВЛЕНИЕ О НАЙМЕ от лица сторонней компании:
+❌ ВАКАНСИЯ / ОБЪЯВЛЕНИЕ О НАЙМЕ от лица сторонней компании или команды:
    "Застройщик X ищет директора по продажам"
    "ООО Туч ищет руководителя"
    "Компания N ищет сотрудника в штат"
-   → Это объявление о найме, НЕ запрос подрядчика.
+   "Наша команда расширяется, ищем опытного маркетолога"
+   "Команда расширение... ищем" (любые формы "команда + ищем/расширяемся")
+   "Присылайте резюме / портфолио и прайс"
+   "Зарплата от X / Вилка / Соцпакет / 5/2"
+   → Это объявление о найме, НЕ запрос подрядчика. score = 0-20.
+
+❌ ВАКАНСИЯ НА УЗБЕКСКОМ / ТАДЖИКСКОМ / СМЕШАННОМ ЯЗЫКЕ:
+   Любой текст с узбекскими словами найма:
+   "кидирамиз" / "кидирвомиз" / "кидирилади" (= узб. «ищем» / «требуется»)
+   "командага" / "командамиз" (= узб. «в команду» / «наша команда»)
+   "талаб килин" / "иш буш" (= узб. «требуется» / «вакансия»)
+   "Ассаламу алейкум, команда расширение..." — это всегда найм
+   → даже если слово «таргетолог» есть — это компания ищет таргетолога В ШТАТ.
+   → score = 0.
+
+❌ Текст НЕ на русском или с русскоязычными вкраплениями (узбекский, таджикский,
+   киргизский, арабский, английский HR-пост) — score = 0 если язык не русский.
 
 ❌ АНАЛИТИКА / ОБЗОР РЫНКА (экспертный пост):
    Признаки: "О чём это говорит?", "Это сигнал", "Тенденция", "Функция X становится...",
@@ -355,20 +482,43 @@ async def _fetch_fts_candidates(keywords: list[str], stop_keywords: list[str],
         LIMIT ?
     """
     rows: list[dict] = []
+    seen_hashes: set[str] = set()
+    skipped = {"blacklist": 0, "stopwords": 0, "too_short": 0,
+               "non_cyrillic": 0, "hiring_post": 0, "no_intent_marker": 0,
+               "dup_text": 0}
     async with aiosqlite.connect(APEX_DB) as db:
         db.row_factory = aiosqlite.Row
         try:
-            async with db.execute(sql, (fts_q, cutoff, limit)) as cur:
+            # Берём в 3× больше чем нужно — после фильтров останется примерно limit.
+            async with db.execute(sql, (fts_q, cutoff, limit * 3)) as cur:
                 async for row in cur:
                     chat_key = row["chat_key"] or ""
                     if should_skip_chat(chat_key):
+                        skipped["blacklist"] += 1
                         continue
-                    text_lower = row["text"].lower()
+                    text = row["text"] or ""
+                    text_lower = text.lower()
                     if any(sk in text_lower for sk in stop_keywords + GLOBAL_STOP_PHRASES):
+                        skipped["stopwords"] += 1
                         continue
+                    # Дедуп по нормализованному тексту (репосты в разных чатах = 1 лид)
+                    text_hash = _normalize_for_dedup(text)
+                    if text_hash and text_hash in seen_hashes:
+                        skipped["dup_text"] += 1
+                        continue
+                    # Pre-AI фильтр (язык, hiring, intent)
+                    passed, reason = _passes_pre_ai_filter(text)
+                    if not passed:
+                        skipped[reason] = skipped.get(reason, 0) + 1
+                        continue
+                    seen_hashes.add(text_hash)
                     rows.append(dict(row))
+                    if len(rows) >= limit:
+                        break
         except Exception as e:
             logger.error(f"FTS SEARCH error: {e}, query={fts_q!r}")
+    if any(v > 0 for v in skipped.values()):
+        logger.info(f"pre-AI filter: {skipped}; kept={len(rows)}")
     return rows
 
 
@@ -549,14 +699,30 @@ async def find_fresh_leads_for_subscriber(user_id: int, hours: int = 24,
         LIMIT ?
     """
     candidates: list[dict] = []
+    seen_hashes: set[str] = set()
     async with aiosqlite.connect(APEX_DB) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(sql, (fts_q, cutoff, limit * 5)) as cur:
+        async with db.execute(sql, (fts_q, cutoff, limit * 10)) as cur:
             async for row in cur:
-                text_lower = row["text"].lower()
-                if any(sk in text_lower for sk in niche_info.get("stop_keywords", [])):
+                chat_key = row["chat_key"] or ""
+                if should_skip_chat(chat_key):
                     continue
+                text = row["text"] or ""
+                text_lower = text.lower()
+                if any(sk in text_lower for sk in niche_info.get("stop_keywords", []) + GLOBAL_STOP_PHRASES):
+                    continue
+                # Дедуп репостов
+                text_hash = _normalize_for_dedup(text)
+                if text_hash and text_hash in seen_hashes:
+                    continue
+                # Pre-AI фильтр (язык/найм/intent)
+                passed, _ = _passes_pre_ai_filter(text)
+                if not passed:
+                    continue
+                seen_hashes.add(text_hash)
                 candidates.append(dict(row))
+                if len(candidates) >= limit * 5:
+                    break
 
     sem = asyncio.Semaphore(5)
 
