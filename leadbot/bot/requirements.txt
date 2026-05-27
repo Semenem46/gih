@@ -1,0 +1,6 @@
+aiogram>=3.4,<4
+python-dotenv>=1.0
+aiosqlite>=0.19
+openai>=1.30
+tenacity>=8.2
+httpx>=0.26

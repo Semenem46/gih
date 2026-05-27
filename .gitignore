@@ -1,0 +1,44 @@
+# Secrets — never commit
+.env
+*/.env
+.env.*
+!.env.example
+!*/.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Databases & sessions (TG)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.backup_*
+*.session
+*.session-journal
+
+# Logs / runtime
+*.log
+.pid_*
+discoverer_budget.json
+parser_offsets.json
+
+# Backups
+*.bak_*
+*.backup*
+*.zip
+
+# Local data
+chats_audit.csv
+chats_full_audit.csv
+pavel_strict_leads.csv
+audit_result.xlsx
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

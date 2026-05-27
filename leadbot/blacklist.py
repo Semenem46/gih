@@ -59,6 +59,15 @@ BLACKLIST_PATTERNS = [
     r"\bbaraholka",
     r"барахол",
     r"\bobjavleni",
+    # Каналы-агрегаторы / биржи (контакты за PRO-подпиской — бесполезные лиды)
+    r"proektport",
+    r"workspot",
+    r"vakanc.*direct",
+    r"freelancehunt",
+    r"upwork_ru",
+    r"_aukcion",
+    r"\bbiding",
+    r"buyguide",
     # Аренда квартир / бытовуха не наша
     r"kvartira_ish",
     r"_obi",  # @mahachkala_obi и подобные «общаги»
