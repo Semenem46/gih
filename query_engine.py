@@ -45,7 +45,15 @@ ANTI_INTENT_MARKERS = [
     "подскажите как сделать", "как реализовать", "как настроить", "какой выбрать стек", "посоветуйте библиотек", 
     "посоветуйте сервис", "у меня не работает", "выдаёт ошибку", "не получается", "ребят, такой вопрос", 
     "коллеги, вопрос", "поделитесь опытом", "делаю под ключ", "берусь за", "веду проекты", "оказываю услуги", 
-    "запишитесь на курс", "приходи на марафон", "наставничество", "обучу за", "мастер-группа"
+    "запишитесь на курс", "приходи на марафон", "наставничество", "обучу за", "мастер-группа",
+    # Самопродвижение / предложение своих услуг
+    "создам", "сделаю", "настрою", "разработаю", "помогу с", "предлагаю услуги", "мои услуги",
+    "моя работа состоит", "я графический дизайнер", "я дизайнер", "я маркетолог", "я директолог",
+    "я специалист", "я фрилансер", "я разработчик", "я программист", "я таргетолог",
+    "продающий дизайн", "меня зовут", "мое портфолио", "моё портфолио", "мои кейсы",
+    "пишите в лс", "пишите в личку", "обращайтесь", "готов взять", "возьму проект",
+    "беру заказы", "принимаю заказы", "открыт для заказов", "свободен для проектов",
+    "предлагаю сотрудничество", "ищу клиентов", "ищу заказчиков", "ищу проекты"
 ]
 
 HIRING_MARKERS = [
@@ -195,7 +203,7 @@ async def count_potential_leads(keywords: list[str], days: int = LOOKBACK_DAYS) 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=30), retry=retry_if_not_exception_type(RuntimeError))
 async def qualify_message_for_niche(text: str, niche_info: dict) -> dict:
-    prompt = f"""Ты — СТРОГИЙ Lead Qualifier. По умолчанию REJECT. APPROVE только если все 6 GATE пройдены подряд.
+    prompt = f"""Ты — СТРОГИЙ Lead Qualifier. По умолчанию REJECT. APPROVE только если ВСЕ 7 GATE пройдены подряд без "может быть".
 ПРОФИЛЬ КЛИЕНТА:
 service: {niche_info.get('service') or niche_info.get('niche_canonical')}
 vertical: {niche_info.get('vertical') or 'не указано'}
@@ -209,9 +217,10 @@ GATE 2a — VERTICAL (если strict): нет слов из vertical_keywords �
 GATE 2b — SERVICE (ВСЕГДА): искомая услуга ДОЛЖНА совпадать с service клиента или его service_keywords. Если клиент = директолог, а просят чат-бота/CRM/SEO/SMM -> REJECT, service_match=false.
 GATE 3 — ТИП: вакансия/резюме/новость/вопрос на форуме/продажа услуг → REJECT.
 GATE 4 — ИНТЕНТ: "ищу", "нам нужен", "ищем команду", "хочу заказать". Без этого → REJECT.
-GATE 5 — РОЛЬ: автор = заказчик.
+GATE 5 — РОЛЬ: автор = заказчик (тот кто ПЛАТИТ за услугу). Автор НЕ ДОЛЖЕН быть исполнителем/фрилансером/подрядчиком. Если автор ПРЕДЛАГАЕТ свои услуги, рекламирует себя, ищет клиентов — это 100% REJECT.
+GATE 6 — САМОПРОДВИЖЕНИЕ: если в тексте автор рассказывает о СЕБЕ ("меня зовут", "я дизайнер", "создам", "сделаю", "мои кейсы", "моё портфолио", "пишите в лс") — это продажа услуг → REJECT. Настоящий заказчик описывает СВОЮ ЗАДАЧУ, а не свои навыки.
 СКОРИНГ: 95-100 = запрос + конкретика; 90-94 = запрос без бюджета; 85-89 = запрос + service match без деталей. <85 = REJECT. 85-89 — нормальный скор!
-Верни СТРОГО JSON: {{"status": "APPROVE"|"REJECT", "score": 0-100, "service_match": true|false, "vertical_match": true|false, "commercial_intent": true|false, "pain": "фраза", "fit_service": "услуга", "reason": "почему"}}"""
+Верни СТРОГО JSON: {{"status": "APPROVE"|"REJECT", "score": 0-100, "service_match": true|false, "vertical_match": true|false, "commercial_intent": true|false, "is_seller": true|false, "pain": "фраза", "fit_service": "услуга", "reason": "почему"}}"""
     res = await ai_client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}, temperature=0.0)
     out = json.loads(res.choices[0].message.content)
     if niche_info.get("vertical_strict") and out.get("vertical_match") is False:
@@ -220,6 +229,8 @@ GATE 5 — РОЛЬ: автор = заказчик.
         out["status"] = "REJECT"; out["score"] = 0
     if out.get("commercial_intent") is False:
         out["status"] = "REJECT"; out["score"] = min(out.get("score", 0), 49)
+    if out.get("is_seller") is True:
+        out["status"] = "REJECT"; out["score"] = 0; out["reason"] = "seller/self-promo"
     return out
 
 async def _fetch_fts_candidates(niche_info: dict, days: int, exclude_claimed_for_user: Optional[int], limit: int) -> list[dict]:
@@ -359,25 +370,6 @@ async def find_leads(user_id: int, niche_text: str, n: int = DEFAULT_LIMIT, nich
                     logger.info("Funnel L3 (adjacent): %d candidates -> %d qualified", len(new_candidates_l3), len(q3))
         except Exception as e:
             logger.warning("Funnel L3 (adjacent) failed: %s", e)
-
-    # ═══ FALLBACK: ДЕМО-ЛИД ИЗ КЭША ═══
-    if not all_qualified:
-        async with aiosqlite.connect(APEX_DB) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, mc.sender_username, mc.sender_id, mc.msg_date, pr.ai_score, pr.ai_pain, pr.ai_fit_service "
-                "FROM pending_review pr JOIN messages_corpus mc ON mc.id = pr.corpus_id WHERE pr.ai_score >= 85 AND pr.status = 'pending' ORDER BY pr.id DESC LIMIT 1"
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    all_qualified.append({
-                        "corpus_id": row["id"],
-                        "text": "\u26a0\ufe0f [В текущем окне парсинга живых запросов нет. Это демонстрационный пример эталонного лида из нашего кэша, чтобы вы увидели качество ИИ-анализа боли клиента]:\n\n" + (row["text"] or ""),
-                        "link": row["link"], "chat_title": row["chat_title"], "chat_key": row["chat_key"],
-                        "sender_username": row["sender_username"], "sender_id": row["sender_id"], "msg_date": row["msg_date"],
-                        "score": row["ai_score"], "pain": "\ud83d\udd25 [ДЕМО-КЭШ]: " + (row["ai_pain"] or ""), "fit_service": row["ai_fit_service"],
-                        "funnel_level": "demo_cache"
-                    })
 
     all_qualified.sort(key=lambda x: (x.get("score", 0), x.get("msg_date", "")), reverse=True)
     return {"niche_info": niche_info, "stats": {"corpus_match": total_corpus, "qualified": len(all_qualified), "lookback_days": LOOKBACK_DAYS, "funnel_level": funnel_level}, "leads": all_qualified[:n]}
