@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+venv/
+.venv/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# Telethon sessions
+*.session
+*.session-journal
+
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Data (runtime)
+data/
+*.json
+!package.json
+
+# Backups
+*.bak
+*.bak_*
+backups_*/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Archives (keep in git but ignore contents that may have sensitive data)
+# archive/ is tracked
+
+# Misc
+*.xlsx
+*.csv
+*.pid_*
+.pid_*
