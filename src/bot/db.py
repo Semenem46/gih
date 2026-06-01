@@ -59,8 +59,9 @@ def connect() -> Iterator[sqlite3.Connection]:
         isolation_level=None,  # autocommit
     )
     cx.row_factory = sqlite3.Row
-    cx.execute("PRAGMA foreign_keys = ON")
     cx.execute("PRAGMA journal_mode = WAL")
+    cx.execute("PRAGMA foreign_keys = ON")
+    cx.execute("PRAGMA busy_timeout = 5000")
     try:
         yield cx
     finally:

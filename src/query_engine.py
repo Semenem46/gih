@@ -18,6 +18,7 @@ except ImportError:
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 from paths import APEX_DB as _PATHS_APEX_DB
+from source_policy import ensure_source_policy_columns
 
 APEX_DB = os.environ.get("APEX_DB") or _PATHS_APEX_DB
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '') or "sk-d75f7d76a50c49648aaf061611ce62b5"
@@ -25,12 +26,24 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 QUALIFIER_THRESHOLD = 85
 
 GLOBAL_STOP_PHRASES = [
-    "доступно в pro", "доступно в про", "pro подписк", "про подписк", "pro-участник", "про-участник", 
-    "получили этот контакт", "получили эту вакансию", "контакт автора скрыт", "автор скрыт", 
-    "хочешь быть в числе первых", "оформи подписку чтобы", "только для платных", "premium участник", 
-    "премиум участник", "forms.gle", "google.com/forms", "при поддержк", "заполните анкету", 
-    "заполните форму", "отклик через форму", "фриланс кот", "#вакансия", "#вакансии", "вакансий чат", 
-    "работа удалённо", "удаленка"
+    # PRO / Premium / VIP / платный доступ
+    "доступно в pro", "доступно в про", "pro подписк", "про подписк",
+    "pro-участник", "про-участник", "premium", "vip",
+    "только для платных", "оформи подписку", "доступ после оплаты",
+    # Скрытый контакт / посредник
+    "получили этот контакт", "получили эту вакансию",
+    "контакт автора скрыт", "автор скрыт",
+    "хочешь быть в числе первых", "премиум участник",
+    # Биржи / тендеры / агрегаторы
+    "биржа", "тендер", "агрегатор",
+    # Формы / анкеты
+    "forms.gle", "google.com/forms", "при поддержк",
+    "заполните анкету", "заполните форму", "отклик через форму",
+    # Вакансии / работа
+    "#вакансия", "#вакансии", "вакансий чат",
+    "работа удалённо", "удаленка",
+    # Фриланс-свалка
+    "фриланс кот",
 ]
 
 INTENT_MARKERS = [
@@ -43,11 +56,38 @@ INTENT_MARKERS = [
 ]
 
 ANTI_INTENT_MARKERS = [
-    "подскажите как сделать", "как реализовать", "как настроить", "какой выбрать стек", "посоветуйте библиотек", 
-    "посоветуйте сервис", "у меня не работает", "выдаёт ошибку", "не получается", "ребят, такой вопрос", 
-    "коллеги, вопрос", "поделитесь опытом", "делаю под ключ", "берусь за", "веду проекты", "оказываю услуги", 
-    "запишитесь на курс", "приходи на марафон", "наставничество", "обучу за", "мастер-группа"
+    "подскажите как сделать", "как реализовать", "как настроить", "какой выбрать стек",
+    "посоветуйте библиотек", "посоветуйте сервис",
+    "у меня не работает", "выдаёт ошибку", "не получается",
+    "ребят, такой вопрос", "коллеги, вопрос", "поделитесь опытом",
+    "запишитесь на курс", "приходи на марафон", "наставничество",
+    "обучу за", "мастер-группа",
 ]
+
+# Регулярные выражения для фильтра самопиара (SELF_PROMO)
+# Ловят «я дизайнер», «мы — студия», «мои услуги», «портфолио» и т.д.
+SELF_PROMO_RX = re.compile(
+    r"(?:"
+    # «я/мы + профессия»
+    r"\b(?:я|мы)\s+(?:—\s*)?(?:дизайнер|маркетолог|директолог|таргетолог|сеошник|seo|smm|копирайтер|разработчик|программист|фрилансер|специалист|студия|агентство|команда)\w*"
+    r"|"
+    # прямое предложение услуг
+    r"(?:предлагаю|оказываю|делаю\s+под\s+ключ|берусь\s+за|веду\s+проекты|оказываем|предлагаем)\s+\w+"
+    r"|"
+    # самореклама
+    r"мои?\s+(?:услуги|портфолио|работы|кейсы|проекты)"
+    r"|"
+    # призыв в личку
+    r"(?:пишите|пиши|обращайтесь|обращайся)\s+(?:в\s+)?(?:лс|л\.с\.|личк|дм|dm|директ)"
+    r"|"
+    # портфолио / отзывы / кейсы в чистом виде
+    r"\b(?:портфолио|отзывы\s+клиентов|мой\s+сайт|моё?\s+портфолио)\b"
+    r"|"
+    # «создам / сделаю / настрою + услугу»
+    r"\b(?:создам|сделаю|настрою|разработаю|запущу|помогу\s+с)\s+(?:дизайн|сайт|лендинг|рекламу|воронку|бот|приложение|логотип|фирменный|маркетинг)\w*"
+    r")",
+    re.IGNORECASE | re.UNICODE,
+)
 
 HIRING_MARKERS = [
     "в команду", "в нашу команду", "в нашу студию", "в наш отдел", "в штат", "штатно", "оформление по тк", 
@@ -83,7 +123,10 @@ def _has_intent_markers(text: str) -> bool:
 
 def _has_anti_intent(text: str) -> bool:
     if not text: return False
-    return any(m in text.lower() for m in ANTI_INTENT_MARKERS)
+    t = text.lower()
+    if any(m in t for m in ANTI_INTENT_MARKERS): return True
+    if SELF_PROMO_RX.search(t): return True
+    return False
 
 def _is_hiring_post(text: str) -> bool:
     if not text: return False
@@ -117,6 +160,7 @@ async def init_apex_db() -> None:
         await db.execute("CREATE TABLE IF NOT EXISTS claimed_leads (corpus_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_claimed_user ON claimed_leads(user_id)")
         await db.execute("CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, niche_text TEXT NOT NULL, niche_keywords TEXT, started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, leads_delivered INTEGER DEFAULT 0, status TEXT DEFAULT 'active')")
+        await ensure_source_policy_columns(db)
         await db.commit()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=30), retry=retry_if_not_exception_type(RuntimeError))
@@ -228,7 +272,18 @@ async def _fetch_fts_candidates(niche_info: dict, days: int, exclude_claimed_for
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     stop_keywords = niche_info.get("stop_keywords", [])
     neg_verts = niche_info.get("negative_verticals", [])
-    sql = "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, mc.sender_username, mc.sender_id, mc.msg_date FROM messages_corpus mc JOIN messages_fts fts ON mc.id = fts.rowid WHERE messages_fts MATCH ? AND mc.msg_date >= ? AND mc.id NOT IN (SELECT corpus_id FROM claimed_leads) ORDER BY mc.msg_date DESC LIMIT ?"
+    sql = (
+        "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, "
+        "mc.sender_username, mc.sender_id, mc.msg_date, "
+        "COALESCE(tc.source_policy, 'mixed') AS source_policy "
+        "FROM messages_corpus mc "
+        "JOIN messages_fts fts ON mc.id = fts.rowid "
+        "LEFT JOIN target_chats tc ON tc.chat_identifier = mc.chat_key "
+        "WHERE messages_fts MATCH ? AND mc.msg_date >= ? "
+        "AND mc.id NOT IN (SELECT corpus_id FROM claimed_leads) "
+        "AND COALESCE(tc.source_policy, 'mixed') != 'block' "
+        "ORDER BY mc.msg_date DESC LIMIT ?"
+    )
     rows: list[dict] = []
     seen_hashes: set[str] = set()
     async with aiosqlite.connect(APEX_DB) as db:
@@ -360,25 +415,6 @@ async def find_leads(user_id: int, niche_text: str, n: int = DEFAULT_LIMIT, nich
                     logger.info("Funnel L3 (adjacent): %d candidates -> %d qualified", len(new_candidates_l3), len(q3))
         except Exception as e:
             logger.warning("Funnel L3 (adjacent) failed: %s", e)
-
-    # ═══ FALLBACK: ДЕМО-ЛИД ИЗ КЭША ═══
-    if not all_qualified:
-        async with aiosqlite.connect(APEX_DB) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, mc.sender_username, mc.sender_id, mc.msg_date, pr.ai_score, pr.ai_pain, pr.ai_fit_service "
-                "FROM pending_review pr JOIN messages_corpus mc ON mc.id = pr.corpus_id WHERE pr.ai_score >= 85 AND pr.status = 'pending' ORDER BY pr.id DESC LIMIT 1"
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    all_qualified.append({
-                        "corpus_id": row["id"],
-                        "text": "\u26a0\ufe0f [В текущем окне парсинга живых запросов нет. Это демонстрационный пример эталонного лида из нашего кэша, чтобы вы увидели качество ИИ-анализа боли клиента]:\n\n" + (row["text"] or ""),
-                        "link": row["link"], "chat_title": row["chat_title"], "chat_key": row["chat_key"],
-                        "sender_username": row["sender_username"], "sender_id": row["sender_id"], "msg_date": row["msg_date"],
-                        "score": row["ai_score"], "pain": "\ud83d\udd25 [ДЕМО-КЭШ]: " + (row["ai_pain"] or ""), "fit_service": row["ai_fit_service"],
-                        "funnel_level": "demo_cache"
-                    })
 
     all_qualified.sort(key=lambda x: (x.get("score", 0), x.get("msg_date", "")), reverse=True)
     return {"niche_info": niche_info, "stats": {"corpus_match": total_corpus, "qualified": len(all_qualified), "lookback_days": LOOKBACK_DAYS, "funnel_level": funnel_level}, "leads": all_qualified[:n]}

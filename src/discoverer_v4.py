@@ -31,6 +31,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from paths import APEX_DB as _PATHS_APEX_DB, DISCOVERER_V4_SESSION as _PATHS_V4_SESSION, DISCOVERER_BUDGET_FILE as _PATHS_BUDGET
 from blacklist import should_skip_chat
+from source_policy import classify_chat, ensure_source_policy_columns
 
 APEX_DB = os.environ.get("APEX_DB") or _PATHS_APEX_DB
 SESSION_PATH = os.environ.get("DISCOVERER_V4_SESSION") or _PATHS_V4_SESSION
@@ -42,11 +43,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 groq = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", max_retries=2, timeout=30.0)
 
 FALLBACK_QUERIES = [
-    "бизнес чат", "предприниматели", "стартап", "нетворкинг", "b2b чат",
-    "маркетинг чат", "smm чат", "контекстная реклама", "директ чат",
-    "seo чат", "таргет чат", "фриланс чат", "дизайн чат",
-    "разработка чат", "продажи чат", "недвижимость чат", "логистика чат",
-    "юристы чат", "бухгалтерия чат", "строительство чат",
+    # Только целевые запросы с высоким коммерческим интентом
+    "маркетинг чат", "smm чат", "seo чат",
+    "контекстная реклама", "директ чат", "таргет чат",
+    "подрядчики чат", "ищу подрядчика",
+    "нужен маркетолог", "реклама яндекс",
+    "лидогенерация", "лидген чат",
+    "директологи чат", "таргетологи чат",
+    "веб разработка чат", "дизайн заказ",
 ]
 
 
@@ -83,10 +87,10 @@ async def generate_search_queries(niches: list[str]) -> list[str]:
 
 Правила:
 - Каждый запрос — 2-4 слова
-- Ищи чаты предпринимателей, владельцев бизнеса, фрилансеров
-- Добавляй слова: "чат", "сообщество", "бизнес", "предприниматели"
-- НЕ ищи "работа", "вакансии", "резюме"
-- НЕ ищи "заработок", "крипта", "инвестиции"
+- Ищи ТОЛЬКО узкоцелевые B2B-чаты, где публикуются КОММЕРЧЕСКИЕ ЗАПРОСЫ на услуги
+- Примеры хороших: "маркетинг чат", "seo заказчики", "директ подрядчики", "лидогенерация чат"
+- НЕ ищи: "работа", "вакансии", "резюме", "фриланс", "нетворкинг", "предприниматели", "стартап"
+- НЕ ищи: "заработок", "крипта", "инвестиции", "биржа"
 
 Ответь СТРОГО JSON: {{"queries": ["запрос1", "запрос2", ...]}}"""
 
@@ -234,16 +238,23 @@ async def main_loop():
                 status = "approved" if is_good else "rejected"
                 print(f"  @{c['username']}: {status} — {reason}")
 
+                policy, policy_reason = classify_chat(c["title"], c["username"])
+                if not is_good:
+                    policy = "block"
+                    policy_reason = f"groq_rejected: {reason}"
+
                 with sqlite3.connect(APEX_DB) as db:
                     db.execute(
                         """INSERT OR IGNORE INTO target_chats
-                           (chat_identifier, title, source_query, members_count, is_processed)
-                           VALUES (?, ?, ?, ?, 0)""",
-                        (c["username"], c["title"], c["query"], c.get("participants", 0)),
+                           (chat_identifier, title, source_query, members_count, is_processed,
+                            source_policy, source_reason)
+                           VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                        (c["username"], c["title"], c["query"],
+                         c.get("participants", 0), policy, policy_reason),
                     )
                     db.commit()
 
-                if is_good:
+                if is_good and policy != "block":
                     approved += 1
                     with sqlite3.connect(APEX_DB) as db:
                         db.execute(

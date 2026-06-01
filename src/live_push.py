@@ -239,12 +239,14 @@ async def scan_for_client(client: dict, db_path: str = APEX_DB) -> list[tuple[in
             SELECT mc.id, mc.chat_key, mc.text
             FROM messages_fts
             JOIN messages_corpus mc ON mc.id = messages_fts.rowid
+            LEFT JOIN target_chats tc ON tc.chat_identifier = mc.chat_key
             LEFT JOIN delivered_leads dl
             ON dl.corpus_id = mc.id AND dl.client_user_id = ?
             WHERE messages_fts MATCH ?
             AND mc.id > ?
             AND mc.msg_date >= ?
             AND dl.id IS NULL
+            AND COALESCE(tc.source_policy, 'mixed') != 'block'
             AND NOT EXISTS (
                 SELECT 1 FROM pending_review pr2
                 WHERE pr2.corpus_id = mc.id
