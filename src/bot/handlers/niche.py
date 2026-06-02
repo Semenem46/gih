@@ -72,6 +72,7 @@ async def cb_niche_restart(query: CallbackQuery, state: FSMContext) -> None:
     if not query.from_user or not query.message:
         return
     db.log_event(query.from_user.id, "niche_restart")
+    await state.clear()
     await state.set_state(NicheStates.awaiting_niche)
     await query.message.answer(texts.NICHE_INTRO)
 
@@ -102,6 +103,7 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
         return
 
     db.log_event(user_id, "niche_text", payload=niche_text[:200])
+    await state.update_data(niche_text=None, niche_info=None)
     status_msg = await message.answer(texts.NICHE_ANALYZING)
 
     try:
@@ -194,7 +196,8 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
         reply_markup=kb.niche_paywall_kb(),
     )
 
-    # Сохраняем нишу клиента в state на случай subscribe
+    # Сохраняем нишу клиента в state на случай subscribe, сбрасываем FSM
+    await state.set_state(None)
     await state.update_data(niche_text=niche_text, niche_info=niche_info)
     db.log_event(user_id, "niche_free_lead_shown", payload=str(lead["corpus_id"]))
 
