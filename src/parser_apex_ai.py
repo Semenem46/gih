@@ -30,6 +30,7 @@ import aiosqlite
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import APEX_DB as _PATHS_APEX_DB, PARSER_SESSION as _PATHS_SESSION, PARSER_BUDGET_FILE as _PATHS_BUDGET
+from source_policy import ensure_source_policy_columns
 
 # ==========================================
 # ⚙️ НАСТРОЙКИ
@@ -232,15 +233,20 @@ async def init_db():
             )
         """)
 
+        await ensure_source_policy_columns(db)
         await db.commit()
     logger.info(f"📂 БД готова: {APEX_DB} (messages_corpus + FTS5 + claimed_leads + subscriptions)")
 
 
 async def sync_chats_from_db(chat_offsets: dict) -> dict:
-    """Втягиваем новые чаты из target_chats (туда пишет разведчик)."""
+    """Втягиваем новые чаты из target_chats (туда пишет разведчик).
+    Чаты с source_policy='block' полностью игнорируются."""
     async with aiosqlite.connect(APEX_DB) as db:
         try:
-            async with db.execute("SELECT chat_identifier FROM target_chats WHERE is_processed = 0") as cursor:
+            async with db.execute(
+                "SELECT chat_identifier FROM target_chats "
+                "WHERE is_processed = 0 AND COALESCE(source_policy, 'mixed') != 'block'"
+            ) as cursor:
                 new_chats = await cursor.fetchall()
                 if new_chats:
                     await db.executemany(

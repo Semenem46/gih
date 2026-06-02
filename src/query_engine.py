@@ -18,19 +18,33 @@ except ImportError:
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 from paths import APEX_DB as _PATHS_APEX_DB
+from source_policy import ensure_source_policy_columns
 
 APEX_DB = os.environ.get("APEX_DB") or _PATHS_APEX_DB
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '') or "sk-d75f7d76a50c49648aaf061611ce62b5"
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 QUALIFIER_THRESHOLD = 85
+QUALIFIER_THRESHOLD_FREE = 65
 
 GLOBAL_STOP_PHRASES = [
-    "доступно в pro", "доступно в про", "pro подписк", "про подписк", "pro-участник", "про-участник", 
-    "получили этот контакт", "получили эту вакансию", "контакт автора скрыт", "автор скрыт", 
-    "хочешь быть в числе первых", "оформи подписку чтобы", "только для платных", "premium участник", 
-    "премиум участник", "forms.gle", "google.com/forms", "при поддержк", "заполните анкету", 
-    "заполните форму", "отклик через форму", "фриланс кот", "#вакансия", "#вакансии", "вакансий чат", 
-    "работа удалённо", "удаленка"
+    # PRO / Premium / VIP / платный доступ
+    "доступно в pro", "доступно в про", "pro подписк", "про подписк",
+    "pro-участник", "про-участник", "premium", "vip",
+    "только для платных", "оформи подписку", "доступ после оплаты",
+    # Скрытый контакт / посредник
+    "получили этот контакт", "получили эту вакансию",
+    "контакт автора скрыт", "автор скрыт",
+    "хочешь быть в числе первых", "премиум участник",
+    # Биржи / тендеры / агрегаторы
+    "биржа", "тендер", "агрегатор",
+    # Формы / анкеты
+    "forms.gle", "google.com/forms", "при поддержк",
+    "заполните анкету", "заполните форму", "отклик через форму",
+    # Вакансии / работа
+    "#вакансия", "#вакансии", "вакансий чат",
+    "работа удалённо", "удаленка",
+    # Фриланс-свалка
+    "фриланс кот",
 ]
 
 INTENT_MARKERS = [
@@ -43,11 +57,38 @@ INTENT_MARKERS = [
 ]
 
 ANTI_INTENT_MARKERS = [
-    "подскажите как сделать", "как реализовать", "как настроить", "какой выбрать стек", "посоветуйте библиотек", 
-    "посоветуйте сервис", "у меня не работает", "выдаёт ошибку", "не получается", "ребят, такой вопрос", 
-    "коллеги, вопрос", "поделитесь опытом", "делаю под ключ", "берусь за", "веду проекты", "оказываю услуги", 
-    "запишитесь на курс", "приходи на марафон", "наставничество", "обучу за", "мастер-группа"
+    "подскажите как сделать", "как реализовать", "как настроить", "какой выбрать стек",
+    "посоветуйте библиотек", "посоветуйте сервис",
+    "у меня не работает", "выдаёт ошибку", "не получается",
+    "ребят, такой вопрос", "коллеги, вопрос", "поделитесь опытом",
+    "запишитесь на курс", "приходи на марафон", "наставничество",
+    "обучу за", "мастер-группа",
 ]
+
+# Регулярные выражения для фильтра самопиара (SELF_PROMO)
+# Ловят «я дизайнер», «мы — студия», «мои услуги», «портфолио» и т.д.
+SELF_PROMO_RX = re.compile(
+    r"(?:"
+    # «я/мы + профессия»
+    r"\b(?:я|мы)\s+(?:—\s*)?(?:дизайнер|маркетолог|директолог|таргетолог|сеошник|seo|smm|копирайтер|разработчик|программист|фрилансер|специалист|студия|агентство|команда)\w*"
+    r"|"
+    # прямое предложение услуг
+    r"(?:предлагаю|оказываю|делаю\s+под\s+ключ|берусь\s+за|веду\s+проекты|оказываем|предлагаем)\s+\w+"
+    r"|"
+    # самореклама
+    r"мои?\s+(?:услуги|портфолио|работы|кейсы|проекты)"
+    r"|"
+    # призыв в личку
+    r"(?:пишите|пиши|обращайтесь|обращайся)\s+(?:в\s+)?(?:лс|л\.с\.|личк|дм|dm|директ)"
+    r"|"
+    # портфолио / отзывы / кейсы в чистом виде
+    r"\b(?:портфолио|отзывы\s+клиентов|мой\s+сайт|моё?\s+портфолио)\b"
+    r"|"
+    # «создам / сделаю / настрою + услугу»
+    r"\b(?:создам|сделаю|настрою|разработаю|запущу|помогу\s+с)\s+(?:дизайн|сайт|лендинг|рекламу|воронку|бот|приложение|логотип|фирменный|маркетинг)\w*"
+    r")",
+    re.IGNORECASE | re.UNICODE,
+)
 
 HIRING_MARKERS = [
     "в команду", "в нашу команду", "в нашу студию", "в наш отдел", "в штат", "штатно", "оформление по тк", 
@@ -83,7 +124,10 @@ def _has_intent_markers(text: str) -> bool:
 
 def _has_anti_intent(text: str) -> bool:
     if not text: return False
-    return any(m in text.lower() for m in ANTI_INTENT_MARKERS)
+    t = text.lower()
+    if any(m in t for m in ANTI_INTENT_MARKERS): return True
+    if SELF_PROMO_RX.search(t): return True
+    return False
 
 def _is_hiring_post(text: str) -> bool:
     if not text: return False
@@ -103,12 +147,12 @@ def _normalize_for_dedup(text: str) -> str:
     words = [w for w in _WORD_SPLIT_RX.split(text.lower()) if w]
     return " ".join(words)[:200]
 
-def _passes_pre_ai_filter(text: str, min_cyrillic: float = 0.4) -> tuple[bool, str]:
+def _passes_pre_ai_filter(text: str, min_cyrillic: float = 0.4, relaxed: bool = False) -> tuple[bool, str]:
     if not text or len(text.strip()) < MIN_TEXT_LEN: return False, "too_short"
     if _cyrillic_ratio(text) < min_cyrillic: return False, "non_cyrillic"
     if _is_hiring_post(text): return False, "hiring_post"
     if _has_anti_intent(text): return False, "anti_intent"
-    if not _has_intent_markers(text): return False, "no_intent_marker"
+    if not relaxed and not _has_intent_markers(text): return False, "no_intent_marker"
     return True, ""
 
 async def init_apex_db() -> None:
@@ -117,6 +161,7 @@ async def init_apex_db() -> None:
         await db.execute("CREATE TABLE IF NOT EXISTS claimed_leads (corpus_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_claimed_user ON claimed_leads(user_id)")
         await db.execute("CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, niche_text TEXT NOT NULL, niche_keywords TEXT, started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, leads_delivered INTEGER DEFAULT 0, status TEXT DEFAULT 'active')")
+        await ensure_source_policy_columns(db)
         await db.commit()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=30), retry=retry_if_not_exception_type(RuntimeError))
@@ -139,6 +184,11 @@ async def analyze_niche(niche_text: str) -> dict:
 "what_we_sell": "настройка и аудит контекстной рекламы Яндекс.Директ"
 }}
 
+ПРАВИЛА ДЛЯ VERTICAL_STRICT:
+1. Если клиент указал КОНКРЕТНУЮ сферу/отрасль (например "smm для ресторанов", "сайт для стоматологии", "юрист по недвижимости") — ставь vertical_strict: true и заполни vertical_keywords словами этой сферы.
+2. Если ниша ОБЩАЯ без привязки к сфере (например "директолог", "seo", "smm") — ставь vertical_strict: false.
+3. При vertical_strict=true ОБЯЗАТЕЛЬНО заполни negative_verticals — антонимы сферы (если клиент = рестораны, negative_verticals = ["стоматолог", "медицин", "клиник", "авто", "недвижимост"]).
+
 ПРАВИЛА ДЛЯ SERVICE_KEYWORDS:
 1. Включай название профессии и смежный сленг (контекстолог, директ, контекст).
 2. ОБЯЗАТЕЛЬНО добавляй фразы боли бизнеса: "упал трафик", "дорогие лиды", "сливаем бюджет", "настроить рекламу", "заявки из яндекса".
@@ -159,6 +209,9 @@ async def analyze_niche(niche_text: str) -> dict:
     data["negative_verticals"] = [k.lower().strip() for k in data["negative_verticals"] if k]
     data["stop_keywords"] = [k.lower().strip() for k in data["stop_keywords"] if k]
     data["keywords"] = data["service_keywords"] + data["vertical_keywords"]
+    # Если vertical указан и есть vertical_keywords — принудительно strict
+    if data.get("vertical") and data.get("vertical_keywords"):
+        data["vertical_strict"] = True
     return data
 
 def _safe_kw(kw: str) -> str: return re.sub(r'["()*]', '', kw or '').strip()
@@ -196,39 +249,70 @@ async def count_potential_leads(keywords: list[str], days: int = LOOKBACK_DAYS) 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=30), retry=retry_if_not_exception_type(RuntimeError))
 async def qualify_message_for_niche(text: str, niche_info: dict) -> dict:
-    prompt = f"""Ты — СТРОГИЙ Lead Qualifier. По умолчанию REJECT. APPROVE только если все 6 GATE пройдены подряд.
+    service = niche_info.get('service') or niche_info.get('niche_canonical') or ''
+    vertical = niche_info.get('vertical') or 'не указано'
+    v_strict = niche_info.get('vertical_strict', False)
+    svc_kw = niche_info.get('service_keywords', [])
+    vert_kw = niche_info.get('vertical_keywords', [])
+    neg_verts = niche_info.get('negative_verticals', [])
+    prompt = f"""Ты — Lead Qualifier для B2B-лидгена. Оцени сообщение из Telegram-чата.
 ПРОФИЛЬ КЛИЕНТА:
-service: {niche_info.get('service') or niche_info.get('niche_canonical')}
-vertical: {niche_info.get('vertical') or 'не указано'}
-vertical_strict: {niche_info.get('vertical_strict', False)}
-service_keywords: {niche_info.get('service_keywords', [])}
-vertical_keywords: {niche_info.get('vertical_keywords', [])}
-negative_verticals: {niche_info.get('negative_verticals', [])}
+service: {service}
+vertical: {vertical}
+vertical_strict: {v_strict}
+service_keywords: {svc_kw[:15]}
+vertical_keywords: {vert_kw[:10]}
+negative_verticals: {neg_verts[:10]}
+
 СООБЩЕНИЕ: "{text[:1500]}"
-GATE 1 — ЯЗЫК: не русский → REJECT.
-GATE 2a — VERTICAL (если strict): нет слов из vertical_keywords или есть из negative_verticals → REJECT.
-GATE 2b — SERVICE (ВСЕГДА): искомая услуга ДОЛЖНА совпадать с service клиента или его service_keywords. Если клиент = директолог, а просят чат-бота/CRM/SEO/SMM -> REJECT, service_match=false.
-GATE 3 — ТИП: вакансия/резюме/новость/вопрос на форуме/продажа услуг → REJECT.
-GATE 4 — ИНТЕНТ: "ищу", "нам нужен", "ищем команду", "хочу заказать". Без этого → REJECT.
-GATE 5 — РОЛЬ: автор = заказчик.
-СКОРИНГ: 95-100 = запрос + конкретика; 90-94 = запрос без бюджета; 85-89 = запрос + service match без деталей. <85 = REJECT. 85-89 — нормальный скор!
-Верни СТРОГО JSON: {{"status": "APPROVE"|"REJECT", "score": 0-100, "service_match": true|false, "vertical_match": true|false, "commercial_intent": true|false, "pain": "фраза", "fit_service": "услуга", "reason": "почему"}}"""
+
+ПРАВИЛА ОЦЕНКИ:
+1. ЯЗЫК: не русский → REJECT.
+2. ТИП: вакансия/резюме/новость/продажа СВОИХ услуг ("я дизайнер", "мои услуги", "портфолио") → REJECT.
+3. SERVICE: тема сообщения ДОЛЖНА быть релевантна service клиента или его service_keywords. Если клиент = директолог, а в сообщении про чат-бота/CRM/SEO → service_match=false.
+4. VERTICAL (если vertical_strict=true): сфера бизнеса должна совпадать с vertical_keywords. Если negative_verticals содержит слова из сообщения → vertical_match=false.
+5. ИНТЕНТ: автор выражает потребность в услуге — ПРЯМО ("ищу", "нужен") ИЛИ КОСВЕННО ("хочу настроить", "нам бы", "кто делает", "порекомендуйте", "проблема с рекламой", "упали заявки"). Явный "ищу подрядчика" = бонус к score, но НЕ обязателен.
+
+MATCH_TYPE (обязательно верни одно из):
+- "exact" — точное совпадение service + vertical + есть коммерческий интент
+- "broad_service" — совпадение по service, но vertical шире или не совпадает
+- "adjacent_useful" — тема смежная, но может быть полезна клиенту
+
+СКОРИНГ:
+95-100: явный запрос + конкретика (бюджет, сроки, детали)
+85-94: запрос на услугу без деталей
+70-84: потребность выражена косвенно, но service совпадает
+65-69: потенциально полезный сигнал, service частично совпадает
+<65: нерелевантно → REJECT
+
+Верни СТРОГО JSON: {{"status": "APPROVE"|"REJECT", "score": 0-100, "match_type": "exact"|"broad_service"|"adjacent_useful", "service_match": true|false, "vertical_match": true|false, "commercial_intent": true|false, "pain": "фраза боли или потребности", "fit_service": "какую услугу ищет автор", "reason": "почему"}}"""
     res = await ai_client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}, temperature=0.0)
     out = json.loads(res.choices[0].message.content)
     if niche_info.get("vertical_strict") and out.get("vertical_match") is False:
         out["status"] = "REJECT"; out["score"] = 0
     if out.get("service_match") is False:
-        out["status"] = "REJECT"; out["score"] = 0
-    if out.get("commercial_intent") is False:
-        out["status"] = "REJECT"; out["score"] = min(out.get("score", 0), 49)
+        out["score"] = min(out.get("score", 0), 49)
+        if out["score"] < QUALIFIER_THRESHOLD_FREE:
+            out["status"] = "REJECT"
     return out
 
-async def _fetch_fts_candidates(niche_info: dict, days: int, exclude_claimed_for_user: Optional[int], limit: int) -> list[dict]:
+async def _fetch_fts_candidates(niche_info: dict, days: int, exclude_claimed_for_user: Optional[int], limit: int, relaxed: bool = False) -> list[dict]:
     fts_q = _fts_query_from_niche(niche_info)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     stop_keywords = niche_info.get("stop_keywords", [])
     neg_verts = niche_info.get("negative_verticals", [])
-    sql = "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, mc.sender_username, mc.sender_id, mc.msg_date FROM messages_corpus mc JOIN messages_fts fts ON mc.id = fts.rowid WHERE messages_fts MATCH ? AND mc.msg_date >= ? AND mc.id NOT IN (SELECT corpus_id FROM claimed_leads) ORDER BY mc.msg_date DESC LIMIT ?"
+    sql = (
+        "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, "
+        "mc.sender_username, mc.sender_id, mc.msg_date, "
+        "COALESCE(tc.source_policy, 'mixed') AS source_policy "
+        "FROM messages_corpus mc "
+        "JOIN messages_fts fts ON mc.id = fts.rowid "
+        "LEFT JOIN target_chats tc ON tc.chat_identifier = mc.chat_key "
+        "WHERE messages_fts MATCH ? AND mc.msg_date >= ? "
+        "AND mc.id NOT IN (SELECT corpus_id FROM claimed_leads) "
+        "AND COALESCE(tc.source_policy, 'mixed') != 'block' "
+        "ORDER BY mc.msg_date DESC LIMIT ?"
+    )
     rows: list[dict] = []
     seen_hashes: set[str] = set()
     async with aiosqlite.connect(APEX_DB) as db:
@@ -244,7 +328,7 @@ async def _fetch_fts_candidates(niche_info: dict, days: int, exclude_claimed_for
                     if any(nv in text_lower for nv in neg_verts): continue
                     text_hash = _normalize_for_dedup(text)
                     if text_hash and text_hash in seen_hashes: continue
-                    passed, _ = _passes_pre_ai_filter(text)
+                    passed, _ = _passes_pre_ai_filter(text, relaxed=relaxed)
                     if not passed: continue
                     seen_hashes.add(text_hash)
                     rows.append(dict(row))
@@ -275,7 +359,7 @@ async def generate_adjacent_keywords(niche_info: dict) -> list[str]:
     return [k.lower().strip() for k in data.get("adjacent_keywords", []) if k]
 
 
-async def _qualify_candidates(candidates: list[dict], niche_info: dict, existing_ids: set[int]) -> list[dict]:
+async def _qualify_candidates(candidates: list[dict], niche_info: dict, existing_ids: set[int], min_score: int = QUALIFIER_THRESHOLD) -> list[dict]:
     """AI-квалификация кандидатов через DeepSeek."""
     filtered = [c for c in candidates if c["id"] not in existing_ids]
     if not filtered:
@@ -288,10 +372,93 @@ async def _qualify_candidates(candidates: list[dict], niche_info: dict, existing
     results = await asyncio.gather(*[qualify_one(c) for c in filtered])
     qualified = []
     for i, r in enumerate(results):
-        if r and r.get("status") == "APPROVE" and r.get("score", 0) >= QUALIFIER_THRESHOLD:
+        if r and r.get("status") == "APPROVE" and r.get("score", 0) >= min_score:
             c = filtered[i]
-            qualified.append({"corpus_id": c["id"], "text": c["text"], "link": c["link"], "chat_title": c["chat_title"], "chat_key": c["chat_key"], "sender_username": c["sender_username"], "sender_id": c.get("sender_id"), "msg_date": c["msg_date"], "score": r.get("score"), "pain": r.get("pain"), "fit_service": r.get("fit_service")})
+            qualified.append({
+                "corpus_id": c["id"], "text": c["text"], "link": c["link"],
+                "chat_title": c["chat_title"], "chat_key": c["chat_key"],
+                "sender_username": c["sender_username"], "sender_id": c.get("sender_id"),
+                "msg_date": c["msg_date"], "score": r.get("score"),
+                "pain": r.get("pain"), "fit_service": r.get("fit_service"),
+                "ai_match_type": r.get("match_type", "broad_service"),
+            })
     return qualified
+
+
+# ═══ Словарь семантического расширения для IT/tech-ниш ═══
+SEMANTIC_EXPANSION: dict[str, list[str]] = {
+    "next.js": ["разработка сайтов", "веб-разработка", "frontend", "react", "лендинг", "корпоративный сайт", "сайт под ключ"],
+    "nextjs": ["разработка сайтов", "веб-разработка", "frontend", "react", "лендинг", "корпоративный сайт"],
+    "react": ["frontend", "разработка сайтов", "веб-разработка", "лендинг", "spa", "веб приложение"],
+    "vue": ["frontend", "разработка сайтов", "веб-разработка", "лендинг", "spa", "веб приложение"],
+    "angular": ["frontend", "разработка сайтов", "веб-разработка", "корпоративный портал"],
+    "frontend": ["разработка сайтов", "веб-разработка", "лендинг", "react", "вёрстка", "корпоративный сайт"],
+    "фронтенд": ["разработка сайтов", "веб-разработка", "лендинг", "вёрстка", "корпоративный сайт"],
+    "backend": ["разработка сайтов", "веб-разработка", "api", "серверная разработка", "python разработка"],
+    "бэкенд": ["разработка сайтов", "веб-разработка", "api", "серверная разработка"],
+    "python": ["разработка", "автоматизация", "бот", "парсинг", "backend", "data science"],
+    "node.js": ["backend", "разработка", "api", "бот", "веб-разработка"],
+    "php": ["разработка сайтов", "wordpress", "битрикс", "веб-разработка", "интернет-магазин"],
+    "wordpress": ["разработка сайтов", "лендинг", "корпоративный сайт", "интернет-магазин", "cms"],
+    "битрикс": ["разработка сайтов", "корпоративный портал", "интернет-магазин", "crm"],
+    "1с-битрикс": ["разработка сайтов", "корпоративный портал", "интернет-магазин", "crm"],
+    "тильда": ["лендинг", "сайт", "корпоративный сайт", "сайт под ключ", "лендинг под ключ"],
+    "tilda": ["лендинг", "сайт", "корпоративный сайт", "сайт под ключ"],
+    "flutter": ["мобильное приложение", "разработка приложений", "ios", "android"],
+    "swift": ["ios разработка", "мобильное приложение", "apple"],
+    "kotlin": ["android разработка", "мобильное приложение"],
+    "мобильное приложение": ["ios разработка", "android разработка", "flutter", "react native"],
+    "сайты": ["разработка сайтов", "лендинг", "корпоративный сайт", "интернет-магазин", "сайт под ключ", "веб-разработка"],
+    "сайт": ["разработка сайтов", "лендинг", "корпоративный сайт", "интернет-магазин", "сайт под ключ"],
+    "лендинг": ["разработка сайтов", "сайт под ключ", "тильда", "посадочная страница", "конверсия"],
+    "интернет-магазин": ["разработка сайтов", "e-commerce", "shopify", "woocommerce", "opencart"],
+    "бот": ["чат-бот", "телеграм бот", "автоматизация", "разработка ботов"],
+    "чат-бот": ["бот", "телеграм бот", "автоматизация", "разработка ботов", "воронка"],
+    "crm": ["автоматизация", "amocrm", "битрикс24", "внедрение crm", "интеграция"],
+    "amocrm": ["crm", "автоматизация", "воронка продаж", "внедрение crm"],
+    "автоматизация": ["crm", "бот", "интеграция", "api", "бизнес-процессы"],
+}
+
+def _get_semantic_expansion(niche_info: dict) -> list[str]:
+    service = (niche_info.get("service") or "").lower().strip()
+    canonical = (niche_info.get("niche_canonical") or "").lower().strip()
+    existing_kw = set(k.lower() for k in niche_info.get("service_keywords", []))
+    expanded: list[str] = []
+    for key, synonyms in SEMANTIC_EXPANSION.items():
+        if key in service or key in canonical or key in existing_kw:
+            for s in synonyms:
+                if s.lower() not in existing_kw:
+                    expanded.append(s)
+    return list(dict.fromkeys(expanded))
+
+
+# ═══ Статичные подсказки для no-result (без Groq) ═══
+HARDCODED_SUGGESTIONS: dict[str, list[str]] = {
+    "директолог": ["Яндекс Директ", "контекстная реклама", "трафик на сайт", "настройка рекламы"],
+    "директ": ["Яндекс Директ", "контекстная реклама", "директолог", "трафик"],
+    "smm": ["ведение соцсетей", "таргет", "продвижение инстаграм", "контент"],
+    "сммщик": ["smm", "ведение соцсетей", "таргет", "продвижение"],
+    "seo": ["продвижение сайта", "поисковая оптимизация", "трафик", "SEO-аудит"],
+    "дизайнер": ["графический дизайн", "логотип", "фирменный стиль", "баннеры", "креативы"],
+    "дизайн": ["графический дизайн", "логотип", "фирменный стиль", "баннеры"],
+    "юрист": ["юридические услуги", "правовая консультация", "договор", "сопровождение"],
+    "сайт": ["разработка сайтов", "лендинг", "корпоративный сайт", "интернет-магазин"],
+    "разработка": ["разработка сайтов", "мобильное приложение", "веб-разработка", "1С"],
+    "маркетинг": ["маркетолог", "продвижение", "лидогенерация", "стратегия"],
+    "маркетолог": ["маркетинг", "стратегия", "лидогенерация", "воронка продаж"],
+    "таргет": ["таргетированная реклама", "реклама ВК", "реклама Facebook", "smm"],
+    "реклама": ["контекстная реклама", "таргет", "Яндекс Директ", "маркетинг"],
+    "копирайтер": ["копирайтинг", "тексты для сайта", "контент", "рассылки"],
+    "бухгалтер": ["бухгалтерия", "бухгалтерские услуги", "ведение учёта", "налоги"],
+}
+
+def _get_noresult_suggestions(niche_info: dict) -> list[str]:
+    service = (niche_info.get("service") or "").lower().strip()
+    canonical = (niche_info.get("niche_canonical") or "").lower().strip()
+    for key, suggestions in HARDCODED_SUGGESTIONS.items():
+        if key in service or key in canonical:
+            return suggestions
+    return []
 
 
 async def find_leads(user_id: int, niche_text: str, n: int = DEFAULT_LIMIT, niche_info: Optional[dict] = None) -> dict:
@@ -299,39 +466,70 @@ async def find_leads(user_id: int, niche_text: str, n: int = DEFAULT_LIMIT, nich
     all_qualified: list[dict] = []
     seen_ids: set[int] = set()
     total_corpus = 0
-    funnel_level = "exact"
+    match_type = "no-result"
+    is_free = (n <= 1)
+    min_score = QUALIFIER_THRESHOLD_FREE if is_free else QUALIFIER_THRESHOLD
 
-    # ═══ УРОВЕНЬ 1: ТОЧНЫЙ ПОИСК (все ключевые + гео) ═══
-    candidates_l1 = await _fetch_fts_candidates(niche_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES)
+    # ═══ УРОВЕНЬ 1: EXACT (точное совпадение ниши + гео, strict pre-filter) ═══
+    candidates_l1 = await _fetch_fts_candidates(niche_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES, relaxed=False)
     total_corpus += len(candidates_l1)
     if candidates_l1:
-        q1 = await _qualify_candidates(candidates_l1, niche_info, seen_ids)
+        q1 = await _qualify_candidates(candidates_l1, niche_info, seen_ids, min_score=min_score)
         for lead in q1:
-            lead["funnel_level"] = "exact"
+            lead["match_type"] = lead.get("ai_match_type", "exact")
             seen_ids.add(lead["corpus_id"])
         all_qualified.extend(q1)
-        logger.info("Funnel L1 (exact): %d candidates -> %d qualified", len(candidates_l1), len(q1))
+        if q1: match_type = "exact"
+        logger.info("Cascade L1 (exact): %d candidates -> %d qualified", len(candidates_l1), len(q1))
 
-    # ═══ УРОВЕНЬ 2: ШИРОКИЙ ПОИСК (без гео, только service_keywords) ═══
+    # ═══ УРОВЕНЬ 2: GEO_RELAXED (точная ниша, без гео, relaxed pre-filter) ═══
+    if len(all_qualified) < n:
+        geo_relaxed_info = dict(niche_info)
+        geo_relaxed_info["geo"] = None
+        geo_relaxed_info["geo_strict"] = False
+        candidates_l2 = await _fetch_fts_candidates(geo_relaxed_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES, relaxed=True)
+        new_l2 = [c for c in candidates_l2 if c["id"] not in seen_ids]
+        total_corpus += len(new_l2)
+        if new_l2:
+            q2 = await _qualify_candidates(new_l2, niche_info, seen_ids, min_score=min_score)
+            for lead in q2:
+                lead["match_type"] = "geo_relaxed"
+                seen_ids.add(lead["corpus_id"])
+            all_qualified.extend(q2)
+            if q2 and match_type == "no-result": match_type = "geo_relaxed"
+            logger.info("Cascade L2 (geo_relaxed): %d candidates -> %d qualified", len(new_l2), len(q2))
+
+    # ═══ УРОВЕНЬ 3: BROAD_SERVICE (relaxed, без vertical_strict + семантическое расширение) ═══
     if len(all_qualified) < n:
         broad_info = dict(niche_info)
         broad_info["geo"] = None
         broad_info["geo_strict"] = False
         broad_info["vertical_strict"] = False
         broad_info["vertical_keywords"] = []
-        candidates_l2 = await _fetch_fts_candidates(broad_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES)
-        new_candidates_l2 = [c for c in candidates_l2 if c["id"] not in seen_ids]
-        total_corpus += len(new_candidates_l2)
-        if new_candidates_l2:
-            q2 = await _qualify_candidates(new_candidates_l2, niche_info, seen_ids)
-            for lead in q2:
-                lead["funnel_level"] = "broad"
+        broad_info["negative_verticals"] = []
+        sem_expand = _get_semantic_expansion(niche_info)
+        if sem_expand:
+            broad_info["service_keywords"] = list(set(broad_info.get("service_keywords", []) + sem_expand))
+            broad_info["keywords"] = broad_info["service_keywords"]
+            logger.info("Semantic expansion: +%d keywords -> %s", len(sem_expand), sem_expand[:5])
+        candidates_l3 = await _fetch_fts_candidates(broad_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES, relaxed=True)
+        new_l3 = [c for c in candidates_l3 if c["id"] not in seen_ids]
+        total_corpus += len(new_l3)
+        if new_l3:
+            broad_qualify = dict(niche_info)
+            broad_qualify["vertical_strict"] = False
+            broad_qualify["negative_verticals"] = []
+            if sem_expand:
+                broad_qualify["service_keywords"] = list(set(niche_info.get("service_keywords", []) + sem_expand))
+            q3 = await _qualify_candidates(new_l3, broad_qualify, seen_ids, min_score=min_score)
+            for lead in q3:
+                lead["match_type"] = lead.get("ai_match_type", "broad_service")
                 seen_ids.add(lead["corpus_id"])
-            all_qualified.extend(q2)
-            funnel_level = "broad"
-            logger.info("Funnel L2 (broad): %d candidates -> %d qualified", len(new_candidates_l2), len(q2))
+            all_qualified.extend(q3)
+            if q3 and match_type == "no-result": match_type = "broad_service"
+            logger.info("Cascade L3 (broad_service): %d candidates -> %d qualified", len(new_l3), len(q3))
 
-    # ═══ УРОВЕНЬ 3: СМЕЖНЫЕ НИШИ (Groq генерирует adjacent keywords) ═══
+    # ═══ УРОВЕНЬ 4: ADJACENT_USEFUL (Groq + relaxed pre-filter) ═══
     if len(all_qualified) < n:
         try:
             adjacent_kw = await generate_adjacent_keywords(niche_info)
@@ -341,47 +539,44 @@ async def find_leads(user_id: int, niche_text: str, n: int = DEFAULT_LIMIT, nich
                 adjacent_info["keywords"] = adjacent_kw
                 adjacent_info["vertical_strict"] = False
                 adjacent_info["vertical_keywords"] = []
+                adjacent_info["negative_verticals"] = []
                 adjacent_info["geo"] = None
                 adjacent_info["geo_strict"] = False
-                candidates_l3 = await _fetch_fts_candidates(adjacent_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES)
-                new_candidates_l3 = [c for c in candidates_l3 if c["id"] not in seen_ids]
-                total_corpus += len(new_candidates_l3)
-                if new_candidates_l3:
-                    adj_niche_for_qualify = dict(niche_info)
-                    adj_niche_for_qualify["service_keywords"] = list(set(niche_info.get("service_keywords", []) + adjacent_kw))
-                    adj_niche_for_qualify["vertical_strict"] = False
-                    q3 = await _qualify_candidates(new_candidates_l3, adj_niche_for_qualify, seen_ids)
-                    for lead in q3:
-                        lead["funnel_level"] = "adjacent"
-                        lead["text"] = "\ud83d\udd04 [Смежная ниша] " + lead["text"]
+                candidates_l4 = await _fetch_fts_candidates(adjacent_info, days=LOOKBACK_DAYS, exclude_claimed_for_user=user_id, limit=FTS_CANDIDATES, relaxed=True)
+                new_l4 = [c for c in candidates_l4 if c["id"] not in seen_ids]
+                total_corpus += len(new_l4)
+                if new_l4:
+                    adj_qualify = dict(niche_info)
+                    adj_qualify["service_keywords"] = list(set(niche_info.get("service_keywords", []) + adjacent_kw))
+                    adj_qualify["vertical_strict"] = False
+                    adj_qualify["negative_verticals"] = []
+                    q4 = await _qualify_candidates(new_l4, adj_qualify, seen_ids, min_score=min_score)
+                    for lead in q4:
+                        lead["match_type"] = "adjacent_useful"
                         seen_ids.add(lead["corpus_id"])
-                    all_qualified.extend(q3)
-                    funnel_level = "adjacent"
-                    logger.info("Funnel L3 (adjacent): %d candidates -> %d qualified", len(new_candidates_l3), len(q3))
+                    all_qualified.extend(q4)
+                    if q4 and match_type == "no-result": match_type = "adjacent_useful"
+                    logger.info("Cascade L4 (adjacent_useful): %d candidates -> %d qualified", len(new_l4), len(q4))
         except Exception as e:
-            logger.warning("Funnel L3 (adjacent) failed: %s", e)
-
-    # ═══ FALLBACK: ДЕМО-ЛИД ИЗ КЭША ═══
-    if not all_qualified:
-        async with aiosqlite.connect(APEX_DB) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT mc.id, mc.text, mc.link, mc.chat_title, mc.chat_key, mc.sender_username, mc.sender_id, mc.msg_date, pr.ai_score, pr.ai_pain, pr.ai_fit_service "
-                "FROM pending_review pr JOIN messages_corpus mc ON mc.id = pr.corpus_id WHERE pr.ai_score >= 85 AND pr.status = 'pending' ORDER BY pr.id DESC LIMIT 1"
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    all_qualified.append({
-                        "corpus_id": row["id"],
-                        "text": "\u26a0\ufe0f [В текущем окне парсинга живых запросов нет. Это демонстрационный пример эталонного лида из нашего кэша, чтобы вы увидели качество ИИ-анализа боли клиента]:\n\n" + (row["text"] or ""),
-                        "link": row["link"], "chat_title": row["chat_title"], "chat_key": row["chat_key"],
-                        "sender_username": row["sender_username"], "sender_id": row["sender_id"], "msg_date": row["msg_date"],
-                        "score": row["ai_score"], "pain": "\ud83d\udd25 [ДЕМО-КЭШ]: " + (row["ai_pain"] or ""), "fit_service": row["ai_fit_service"],
-                        "funnel_level": "demo_cache"
-                    })
+            logger.warning("Cascade L4 (adjacent_useful) failed: %s", e)
 
     all_qualified.sort(key=lambda x: (x.get("score", 0), x.get("msg_date", "")), reverse=True)
-    return {"niche_info": niche_info, "stats": {"corpus_match": total_corpus, "qualified": len(all_qualified), "lookback_days": LOOKBACK_DAYS, "funnel_level": funnel_level}, "leads": all_qualified[:n]}
+
+    suggestions = []
+    if not all_qualified:
+        suggestions = _get_noresult_suggestions(niche_info)
+
+    return {
+        "niche_info": niche_info,
+        "stats": {
+            "corpus_match": total_corpus,
+            "qualified": len(all_qualified),
+            "lookback_days": LOOKBACK_DAYS,
+            "match_type": match_type,
+        },
+        "leads": all_qualified[:n],
+        "suggestions": suggestions,
+    }
 
 async def claim_lead(corpus_id: int, user_id: int) -> bool:
     async with aiosqlite.connect(APEX_DB) as db:

@@ -62,7 +62,7 @@ LEAD_MAGNET_CAPTION: str = (
 # ── База данных ──────────────────────────────────────────────────────────────
 _DATA_DIR = ROOT.parent.parent / "data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH: Path = _DATA_DIR / "leads.db"
+DB_PATH: Path = Path(os.environ.get("APEX_DB") or str(_DATA_DIR / "apex_ai.db"))
 
 # ── Drip-кампания (минуты после получения файла) ─────────────────────────────
 # Подбирай тайминги под свою аудиторию. По умолчанию: 30 мин / 1д / 3д / 7д.

@@ -72,6 +72,7 @@ async def cb_niche_restart(query: CallbackQuery, state: FSMContext) -> None:
     if not query.from_user or not query.message:
         return
     db.log_event(query.from_user.id, "niche_restart")
+    await state.clear()
     await state.set_state(NicheStates.awaiting_niche)
     await query.message.answer(texts.NICHE_INTRO)
 
@@ -102,6 +103,7 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
         return
 
     db.log_event(user_id, "niche_text", payload=niche_text[:200])
+    await state.update_data(niche_text=None, niche_info=None)
     status_msg = await message.answer(texts.NICHE_ANALYZING)
 
     try:
@@ -128,12 +130,19 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
     log.info("niche=%r canonical=%r keywords=%s count=%d",
              niche_text, canonical, keywords, count)
 
-    # Слишком пусто — отказываем мягко (порог 5: меньше шансов получить мусорный лид)
-    if count < 5:
-        await status_msg.edit_text(
-            texts.NICHE_EMPTY.format(niche=canonical, count=count),
-            reply_markup=kb.niche_empty_kb(),
-        )
+    # Даже если FTS-матчей мало, каскад попробует расширить поиск.
+    # Отказываем только если совсем 0 матчей на всех уровнях (count=0).
+    if count == 0:
+        suggestions = []
+        try:
+            from query_engine import _get_noresult_suggestions
+            suggestions = _get_noresult_suggestions(niche_info)
+        except Exception:
+            pass
+        empty_text = texts.NICHE_EMPTY.format(niche=canonical, count=count)
+        if suggestions:
+            empty_text += "\n\n💡 Попробуй: " + ", ".join(f'«{s}»' for s in suggestions[:4])
+        await status_msg.edit_text(empty_text, reply_markup=kb.niche_empty_kb())
         await state.clear()
         return
 
@@ -159,10 +168,14 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
 
     qualified_count = result.get("stats", {}).get("qualified", 0)
     leads = result.get("leads", [])
+    suggestions = result.get("suggestions", [])
 
     if not leads:
+        no_result_text = texts.NICHE_NO_QUALIFIED.format(count=count)
+        if suggestions:
+            no_result_text += "\n\n💡 Попробуй переформулировать: " + ", ".join(f'«{s}»' for s in suggestions[:4])
         await qualifying_msg.edit_text(
-            texts.NICHE_NO_QUALIFIED.format(count=count),
+            no_result_text,
             reply_markup=kb.niche_empty_kb(),
         )
         await state.clear()
@@ -175,9 +188,23 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
     except Exception:
         msg_date = lead.get("msg_date", "—")
 
+    lead_match = lead.get("match_type", "exact")
+    match_labels = {
+        "exact": "🎯 Точный матч",
+        "geo_relaxed": "📍 Гео расширено",
+        "broad_service": "🔍 Широкий поиск по услуге",
+        "adjacent_useful": "🔄 Смежная ниша",
+    }
+    match_label = match_labels.get(lead_match, "")
+
+    if lead_match == "adjacent_useful":
+        match_label = f"🔄 Смежная ниша: Точных лидов по «{canonical}» сейчас нет, но есть похожий горячий запрос"
+
+    match_line = f"\n{match_label}\n" if match_label else ""
+
     await qualifying_msg.delete()
     await message.answer(
-        texts.NICHE_FREE_LEAD.format(
+        match_line + texts.NICHE_FREE_LEAD.format(
             score=lead["score"], text_preview=text_preview,
             chat_title=lead["chat_title"] or "—",
             date=msg_date, pain=lead["pain"], fit_service=lead["fit_service"],
@@ -194,7 +221,8 @@ async def on_niche_text(message: Message, state: FSMContext) -> None:
         reply_markup=kb.niche_paywall_kb(),
     )
 
-    # Сохраняем нишу клиента в state на случай subscribe
+    # Сохраняем нишу клиента в state на случай subscribe, сбрасываем FSM
+    await state.set_state(None)
     await state.update_data(niche_text=niche_text, niche_info=niche_info)
     db.log_event(user_id, "niche_free_lead_shown", payload=str(lead["corpus_id"]))
 
