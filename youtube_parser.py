@@ -19,6 +19,7 @@ from config import (
     MAX_RECENT_SHORTS,
     RECENT_VIDEOS_TO_CHECK,
     MAX_CHANNELS_PER_KEYWORD,
+    SEARCH_RESULTS_PER_KEYWORD,
     APEX_DB,
     logger,
 )
@@ -320,10 +321,17 @@ def parse_duration_seconds(iso_duration: str) -> int:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def search_channels(youtube, keyword: str, max_results: int = MAX_CHANNELS_PER_KEYWORD) -> list:
-    """Двойная стратегия поиска: каналы + видео → уникальные channel_ids."""
+def search_channels(youtube, keyword: str, max_results: int = SEARCH_RESULTS_PER_KEYWORD) -> list:
+    """Двойная стратегия поиска: каналы + видео → уникальные channel_ids.
+
+    ВАЖНО для защиты квоты:
+    - order='date' — свежие ролики маленьких авторов, а не топ-10 миллионников
+    - maxResults ограничен SEARCH_RESULTS_PER_KEYWORD (15)
+    - НЕ используем nextPageToken — один запрос на стратегию
+    """
     found = []
     seen_cids = set()
+    limit = min(max_results, SEARCH_RESULTS_PER_KEYWORD)
 
     # Стратегия 1: Прямой поиск каналов (стандартная)
     try:
@@ -331,7 +339,8 @@ def search_channels(youtube, keyword: str, max_results: int = MAX_CHANNELS_PER_K
             part="snippet",
             q=keyword,
             type="channel",
-            maxResults=min(max_results, 50),
+            maxResults=limit,
+            order="date",
             relevanceLanguage="en",
         ).execute()
         for item in resp.get("items", []):
@@ -348,7 +357,8 @@ def search_channels(youtube, keyword: str, max_results: int = MAX_CHANNELS_PER_K
             part="snippet",
             q=keyword,
             type="video",
-            maxResults=min(max_results, 50),
+            maxResults=limit,
+            order="date",
             relevanceLanguage="en",
             videoDuration="medium",  # 4-20 мин — наш целевой диапазон
         ).execute()

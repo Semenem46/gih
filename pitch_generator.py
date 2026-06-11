@@ -38,9 +38,12 @@ Amazon SES, Postmark, SendGrid и т.п.) — ниже шаблоны, подс�
 
 import sqlite3
 import smtplib
-from datetime import datetime
+import random
+import time
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
+from zoneinfo import ZoneInfo
 
 import httpx
 from groq import Groq
@@ -140,6 +143,55 @@ def generate_pitch(lead: dict, portfolio_link: str = PORTFOLIO_LINK) -> str:
 # ==========================================================================
 def email_sending_enabled() -> bool:
     return False
+
+
+# ==========================================================================
+# АНТИ-СПАМ ЗАЩИТА: US Business Hours + Рваный лимит + Time Jitter
+# ==========================================================================
+_US_EASTERN = ZoneInfo("America/New_York")
+_US_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+# Рваный часовой график: динамический лимит писем в час (имитация человека)
+_HOURLY_LIMITS = [1, 3, 0, 2, 1, 0, 3, 2, 1, 0, 2, 1]
+
+
+def _is_us_business_hours() -> bool:
+    """Проверяет, попадаем ли в рабочие часы US (8:00-18:00 EST или PST)."""
+    now_est = datetime.now(_US_EASTERN)
+    now_pst = datetime.now(_US_PACIFIC)
+    # Считаем рабочим временем если хотя бы в одном часовом поясе 8-18
+    est_ok = 8 <= now_est.hour < 18 and now_est.weekday() < 5  # Пн-Пт
+    pst_ok = 8 <= now_pst.hour < 18 and now_pst.weekday() < 5
+    return est_ok or pst_ok
+
+
+def _get_hourly_send_limit() -> int:
+    """Рваный лимит: разное кол-во писем каждый час (1, 3, 0, 2, ...)."""
+    hour = datetime.now(_US_EASTERN).hour
+    return _HOURLY_LIMITS[hour % len(_HOURLY_LIMITS)]
+
+
+def _apply_jitter() -> None:
+    """Рандомная задержка 15-90 сек между отправками (имитация человека)."""
+    delay = random.uniform(15, 90)
+    logger.info("Jitter delay: %.1f sec before next email", delay)
+    time.sleep(delay)
+
+
+def should_send_email_now() -> bool:
+    """Проверяет все условия антиспама перед отправкой.
+    Возвращает True только если:
+    1. Сейчас рабочие часы в US
+    2. Часовой лимит > 0
+    """
+    if not _is_us_business_hours():
+        logger.info("Outside US business hours — email deferred")
+        return False
+    limit = _get_hourly_send_limit()
+    if limit == 0:
+        logger.info("Hourly limit = 0 (cool-down hour) — email deferred")
+        return False
+    return True
 
 def _build_email_body(pitch: str) -> str:
     """Тело письма: питч + минимальный compliance-футер (US CAN-SPAM)."""
@@ -325,7 +377,11 @@ def process_leads(leads: list, batch_size: int = DEFAULT_BATCH_SIZE,
                 if not is_production_portfolio_link(PORTFOLIO_LINK):
                     status = "pending_review"
                     stats["skipped"] += 1
+                elif not should_send_email_now():
+                    status = "pending_review"
+                    stats["skipped"] += 1
                 else:
+                    _apply_jitter()
                     ok = send_email(lead, pitch)
                     status = "sent" if ok else "send_failed"
                     if ok:

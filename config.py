@@ -73,6 +73,9 @@ RECENT_VIDEOS_TO_CHECK = 30
 # How many channels (max) to pull from search per keyword (YouTube caps at 50).
 MAX_CHANNELS_PER_KEYWORD = 50
 
+# Макс. результатов на один запрос к search.list (для защиты квоты)
+SEARCH_MAX_PER_QUERY = 15
+
 # --- Manual control flag ---------------------------------------------------
 # When False: leads are collected and reported to Telegram, but NO emails are
 # sent automatically (calibration mode). Flip to True once you trust the output.
@@ -89,16 +92,20 @@ KEYWORDS_TO_SEARCH = [
     "personal finance expert talking head",
     "young entrepreneur solo podcast style",
     "ai agency founder talking head",
-    "day trader solo camera studio setup",
-    "crypto analysis solo speaker",
-    "stock market commentary solo face",
-    "ai business solo creator",
-    "passive income talking head creator",
-    "wealth building solo podcast",
-    "investing tips solo camera",
-    "fintech founder solo youtube",
+    "real estate investor talking head solo",
+    "saas founder solo interview style",
+    "productivity tips office setup solo",
+    "trading portfolio breakdown solo",
+    "options trading coach camera face",
+    "commercial real estate advice solo",
+    "ai tools for business creator",
+    "b2b sales tips talking head",
 ]
 KEYWORDS = KEYWORDS_TO_SEARCH
+
+# Лимит результатов на один ключевой запрос (защита квоты API).
+# Каждая стратегия (channel + video) забирает не более этого числа.
+SEARCH_RESULTS_PER_KEYWORD = 15
 
 # Telegram hard message-length cap.
 _TELEGRAM_MAX_LEN = 4096
