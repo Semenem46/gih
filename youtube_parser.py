@@ -321,7 +321,11 @@ def parse_duration_seconds(iso_duration: str) -> int:
 
 
 def search_channels(youtube, keyword: str, max_results: int = MAX_CHANNELS_PER_KEYWORD) -> list:
+    """Двойная стратегия поиска: каналы + видео → уникальные channel_ids."""
     found = []
+    seen_cids = set()
+
+    # Стратегия 1: Прямой поиск каналов (стандартная)
     try:
         resp = youtube.search().list(
             part="snippet",
@@ -332,10 +336,30 @@ def search_channels(youtube, keyword: str, max_results: int = MAX_CHANNELS_PER_K
         ).execute()
         for item in resp.get("items", []):
             cid = item["snippet"].get("channelId") or item.get("id", {}).get("channelId")
-            if cid:
+            if cid and cid not in seen_cids:
+                seen_cids.add(cid)
                 found.append({"channel_id": cid, "channel_name": item["snippet"].get("title")})
     except HttpError as exc:
-        logger.error("search.list failed for '%s': %s", keyword, exc)
+        logger.error("search.list (channel) failed for '%s': %s", keyword, exc)
+
+    # Стратегия 2: Поиск через видео — находит маленьких авторов по контенту
+    try:
+        resp = youtube.search().list(
+            part="snippet",
+            q=keyword,
+            type="video",
+            maxResults=min(max_results, 50),
+            relevanceLanguage="en",
+            videoDuration="medium",  # 4-20 мин — наш целевой диапазон
+        ).execute()
+        for item in resp.get("items", []):
+            cid = item["snippet"].get("channelId")
+            if cid and cid not in seen_cids:
+                seen_cids.add(cid)
+                found.append({"channel_id": cid, "channel_name": item["snippet"].get("channelTitle")})
+    except HttpError as exc:
+        logger.error("search.list (video) failed for '%s': %s", keyword, exc)
+
     return found
 
 
@@ -756,6 +780,7 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
         "subscriber_count": subs,
         "recent_shorts": recent_shorts,
         "latest_video_title": latest_title,
+        "latest_video_id": latest["video_id"],
         "thumbnail_url": thumbnail_url,
         "vision_score": vision_reason,
     }

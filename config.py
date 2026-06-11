@@ -80,16 +80,23 @@ AUTO_SEND_EMAILS = False
 REQUIRE_PRODUCTION_PORTFOLIO = True
 PORTFOLIO_LINK = "https://clck.ru/3BvXyz"
 
-# --- Search keywords (real, profitable English-speaking niches) ------------
+# --- Search keywords (low-frequency, нишевые — целят в 10k-100k авторов) ----
 KEYWORDS_TO_SEARCH = [
-    "talking head day trader studio",
-    "crypto guru face camera camera solo",
-    "business coach studio talking head",
-    "entrepreneur vlog face camera solo",
-    "talking head personal finance expert",
-    "solo trading mentor studio face",
-    "finance advice camera talking head",
-    "vlog business mentor solo face"
+    "solo finance creator talking head",
+    "business tips talking head small channel",
+    "crypto trading vlog solo setup",
+    "solopreneur advice camera room",
+    "personal finance expert talking head",
+    "young entrepreneur solo podcast style",
+    "ai agency founder talking head",
+    "day trader solo camera studio setup",
+    "crypto analysis solo speaker",
+    "stock market commentary solo face",
+    "ai business solo creator",
+    "passive income talking head creator",
+    "wealth building solo podcast",
+    "investing tips solo camera",
+    "fintech founder solo youtube",
 ]
 KEYWORDS = KEYWORDS_TO_SEARCH
 
