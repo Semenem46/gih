@@ -2,16 +2,27 @@ import re
 import base64
 import sqlite3
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import google.generativeai as genai
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from groq import Groq
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    HAS_TRANSCRIPT_API = True
+except ImportError:
+    HAS_TRANSCRIPT_API = False
 
 from config import (
-    YOUTUBE_API_KEY,
+    YOUTUBE_API_KEYS,
+    GEMINI_API_KEY,
     GROQ_API_KEY,
     GROQ_BASE_URL,
+    HF_TOKEN,
     MIN_SUBSCRIBERS,
     MAX_SUBSCRIBERS,
     SHORT_MAX_SECONDS,
@@ -20,9 +31,15 @@ from config import (
     RECENT_VIDEOS_TO_CHECK,
     MAX_CHANNELS_PER_KEYWORD,
     SEARCH_RESULTS_PER_KEYWORD,
+    ALLOWED_COUNTRIES,
     APEX_DB,
     logger,
+    send_telegram_notification,
 )
+
+class QuotaExceededError(Exception):
+    """Custom exception for YouTube API quota exhaustion."""
+    pass
 
 # ==========================================================================
 # КОНСТАНТЫ / РЕГУЛЯРКИ
@@ -55,7 +72,6 @@ VISUAL_SOCIAL_DOMAINS = {"instagram.com", "tiktok.com", "twitter.com", "x.com"}
 # --------------------------------------------------------------------------
 # STEP 1 CONSTANTS: Подписчики + Гео
 # --------------------------------------------------------------------------
-ALLOWED_COUNTRIES = {"US", "GB", "CA", "AU", "NZ", "IE"}
 
 # --------------------------------------------------------------------------
 # STEP 2 CONSTANTS: Жёсткий текстовый блеклист
@@ -63,25 +79,7 @@ ALLOWED_COUNTRIES = {"US", "GB", "CA", "AU", "NZ", "IE"}
 # Инфобиз по продвижению каналов, крипто-фермы, монтажёры, нецелевые языки/гео
 STRICT_BLACKLIST = [
     # Нецелевые языки / гео
-    "brasil", "brazil", "deutsch", "germany", "taller", "español", "espanol",
-    "lanka", "sinhala", "india", "philippines", "tamiles", "arabic", "urdu",
-    "hindi", "indonesia", "français", "francais", "рус", "russia",
-    # Инфобиз по продвижению каналов (мусор)
-    "grow channel", "grow your channel", "youtube tips", "youtube growth",
-    "get more subscribers", "video editing tips", "content creator tips",
-    "personal brand coach", "content creator", "how to grow on youtube",
-    "youtube algorithm", "youtube secrets", "youtube strategy",
-    "faceless channel", "faceless youtube", "automation channel",
-    # Крипто-фермы и мусорные крипто-каналы
-    "crypto club", "crypto farm", "mining rig", "mining setup",
-    "crypto signals", "pump and dump", "bitcoin mining",
-    # Монтажёры / фрилансеры (не авторы контента)
-    "video editor for hire", "editing portfolio", "freelance editor",
-    "motion graphics", "after effects tutorial",
-    # Мусорные форматы
-    "clips", "shorts", "reels", "compilation", "full show",
-    "weekly", "daily", "empire", "zone", "news", "tv",
-    "podcast clips", "funny clips", "car review",
+    "brasil", "brazil",
 ]
 
 # Кириллица, арабица, CJK, хангыль
@@ -155,12 +153,17 @@ def init_lead_tables(db_path: str = APEX_DB) -> None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("""
             CREATE TABLE IF NOT EXISTS raw_leads_queue (
-                channel_id     TEXT PRIMARY KEY,
-                channel_name   TEXT,
-                status         TEXT DEFAULT 'pending',
-                discovered_via TEXT,
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed_at   TIMESTAMP
+                channel_id        TEXT PRIMARY KEY,
+                channel_name      TEXT,
+                status            TEXT DEFAULT 'pending',
+                discovered_via    TEXT,
+                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_at      TIMESTAMP,
+                rejection_reason  TEXT,
+                long_form_count   INTEGER,
+                shorts_count      INTEGER,
+                product_name      TEXT,
+                views_gap         TEXT
             )
         """)
         db.execute("""
@@ -170,7 +173,34 @@ def init_lead_tables(db_path: str = APEX_DB) -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS manual_social_outreach (
+                channel_id         TEXT PRIMARY KEY,
+                channel_name       TEXT,
+                social_links       TEXT,
+                latest_video       TEXT,
+                contact_email      TEXT,
+                preferred_channel  TEXT,
+                x_url              TEXT,
+                instagram_url      TEXT,
+                website_url        TEXT,
+                x_dm               TEXT,
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for stmt in [
+            "ALTER TABLE manual_social_outreach ADD COLUMN contact_email TEXT",
+            "ALTER TABLE manual_social_outreach ADD COLUMN preferred_channel TEXT",
+            "ALTER TABLE manual_social_outreach ADD COLUMN x_url TEXT",
+            "ALTER TABLE manual_social_outreach ADD COLUMN instagram_url TEXT",
+            "ALTER TABLE manual_social_outreach ADD COLUMN website_url TEXT",
+        ]:
+            try:
+                db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON raw_leads_queue(status)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_manual_channel ON manual_social_outreach(preferred_channel)")
         db.commit()
 
 
@@ -221,17 +251,107 @@ def fetch_pending_leads(limit: int, db_path: str = APEX_DB) -> list:
     with _connect(db_path) as db:
         cur = db.execute(
             """SELECT channel_id, channel_name FROM raw_leads_queue
-               WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?""",
+               WHERE status IN ('pending', 'pending_error')
+               ORDER BY status ASC, created_at ASC LIMIT ?""",
             (limit,),
         )
-        return [{"channel_id": r[0], "channel_name": r[1]} for r in cur.fetchall()]
+        rows = cur.fetchall()
+        return [{"channel_id": r[0], "channel_name": r[1]} for r in rows]
 
 
-def mark_queue_status(channel_id: str, status: str, db_path: str = APEX_DB) -> None:
+def get_pending_count(db_path: str = APEX_DB) -> int:
+    """Returns the total number of leads with 'pending' or 'pending_error' status."""
     with _connect(db_path) as db:
+        cur = db.execute("SELECT count(*) FROM raw_leads_queue WHERE status IN ('pending', 'pending_error')")
+        return cur.fetchone()[0]
+
+
+def classify_contact_channels(email: str, social_links: list) -> dict:
+    """Classifies contact channels based on email and social links."""
+    contact_email = email
+    preferred_channel = None
+    x_url = None
+    instagram_url = None
+    website_url = None
+
+    if email:
+        preferred_channel = "email"
+
+    x_urls = []
+    instagram_urls = []
+    website_urls = []
+
+    for link in social_links:
+        if "twitter.com" in link or "x.com" in link:
+            x_urls.append(link)
+        if "instagram.com" in link:
+            instagram_urls.append(link)
+        if "youtube.com" not in link and "twitter.com" not in link and "x.com" not in link and "instagram.com" not in link and "facebook.com" not in link and "tiktok.com" not in link and "t.me" not in link and "discord.com" not in link:
+            website_urls.append(link)
+
+    if x_urls:
+        x_url = x_urls[0]
+        if preferred_channel is None:
+            preferred_channel = "x"
+    if instagram_urls:
+        instagram_url = instagram_urls[0]
+        if preferred_channel is None:
+            preferred_channel = "instagram"
+    if website_urls:
+        website_url = website_urls[0]
+        if preferred_channel is None:
+            preferred_channel = "website"
+
+    return {
+        "contact_email": contact_email,
+        "preferred_channel": preferred_channel,
+        "x_url": x_url,
+        "instagram_url": instagram_url,
+        "website_url": website_url,
+    }
+
+
+def mark_queue_status(channel_id: str, status: str, db_path: str = APEX_DB, reason: str = None, extra_data: dict = None) -> None:
+    with _connect(db_path) as db:
+        fields = ["status = ?", "processed_at = ?"]
+        params = [status, datetime.utcnow().isoformat()]
+        
+        if reason:
+            fields.append("rejection_reason = ?")
+            params.append(reason)
+            
+        if extra_data:
+            for k, v in extra_data.items():
+                fields.append(f"{k} = ?")
+                params.append(v)
+        
+        params.append(channel_id)
+        query = f"UPDATE raw_leads_queue SET {', '.join(fields)} WHERE channel_id = ?"
+        db.execute(query, tuple(params))
+        db.commit()
+
+
+def save_manual_social(lead: dict, db_path: str = APEX_DB) -> None:
+    with _connect(db_path) as db:
+        import json
+        contact = classify_contact_channels(lead.get("contact_email"), lead.get("social_links"))
         db.execute(
-            "UPDATE raw_leads_queue SET status = ?, processed_at = ? WHERE channel_id = ?",
-            (status, datetime.utcnow().isoformat(), channel_id),
+            """INSERT OR REPLACE INTO manual_social_outreach
+                   (channel_id, channel_name, social_links, latest_video, contact_email,
+                    preferred_channel, x_url, instagram_url, website_url, x_dm)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                lead["channel_id"],
+                lead["channel_name"],
+                json.dumps(lead.get("social_links", [])),
+                lead.get("latest_video_title"),
+                lead.get("contact_email"),
+                contact["preferred_channel"],
+                contact["x_url"],
+                contact["instagram_url"],
+                contact["website_url"],
+                lead.get("x_dm"),
+            ),
         )
         db.commit()
 
@@ -267,6 +387,8 @@ def get_pinned_comments_email(youtube, video_id: str):
             if m:
                 logger.info(f"OSINT: Found email in comments of video {video_id}")
                 return m.group(0)
+    except QuotaExceededError:
+        raise
     except Exception as e:
         logger.warning(f"OSINT: Failed to fetch comments for {video_id}: {e}")
     return None
@@ -309,9 +431,28 @@ def validate_email_address(email: str):
 # ==========================================================================
 # YOUTUBE API
 # ==========================================================================
-def get_youtube_client():
-    return build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+_current_key_index = 0
 
+def get_youtube_client():
+    """Возвращает клиент YouTube API, используя текущий активный ключ."""
+    import httplib2
+    global _current_key_index
+    key = YOUTUBE_API_KEYS[_current_key_index % len(YOUTUBE_API_KEYS)]
+    http = httplib2.Http(timeout=60)
+    return build("youtube", "v3", developerKey=key, cache_discovery=False, http=http)
+
+def rotate_youtube_key() -> bool:
+    """Переключает на следующий API-ключ. Возвращает False, если ключи кончились."""
+    global _current_key_index
+    _current_key_index += 1
+    if _current_key_index >= len(YOUTUBE_API_KEYS):
+        logger.error("❌ ALL YOUTUBE API KEYS EXHAUSTED.")
+        return False
+    
+    new_key = YOUTUBE_API_KEYS[_current_key_index % len(YOUTUBE_API_KEYS)]
+    logger.info("🔄 Rotating YouTube API key to next one (index %d): %s...", 
+                _current_key_index, new_key[:10])
+    return True
 
 def parse_duration_seconds(iso_duration: str) -> int:
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_duration or "")
@@ -321,7 +462,19 @@ def parse_duration_seconds(iso_duration: str) -> int:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def search_channels(youtube, keyword: str, max_results: int = SEARCH_RESULTS_PER_KEYWORD) -> list:
+def handle_api_error(exc, context: str):
+    """Логирует ошибку и выбрасывает QuotaExceededError при исчерпании квоты."""
+    if isinstance(exc, HttpError):
+        content = str(exc).lower()
+        is_quota = (exc.resp.status in [403, 429]) and ("quota" in content or "limit" in content)
+        
+        if is_quota:
+            logger.error("🛑 QUOTA EXCEEDED: %s failed.", context)
+            raise QuotaExceededError(f"Quota exceeded during {context}")
+        
+    logger.error("%s failed: %s", context, exc)
+
+def search_channels(youtube, keyword: str, limit: int = SEARCH_RESULTS_PER_KEYWORD) -> list:
     """Двойная стратегия поиска: каналы + видео → уникальные channel_ids.
 
     ВАЖНО для защиты квоты:
@@ -331,9 +484,7 @@ def search_channels(youtube, keyword: str, max_results: int = SEARCH_RESULTS_PER
     """
     found = []
     seen_cids = set()
-    limit = min(max_results, SEARCH_RESULTS_PER_KEYWORD)
-
-    # Стратегия 1: Прямой поиск каналов (стандартная)
+    # Стратегия 1: Поиск каналов по ключевым словам
     try:
         resp = youtube.search().list(
             part="snippet",
@@ -348,8 +499,10 @@ def search_channels(youtube, keyword: str, max_results: int = SEARCH_RESULTS_PER
             if cid and cid not in seen_cids:
                 seen_cids.add(cid)
                 found.append({"channel_id": cid, "channel_name": item["snippet"].get("title")})
-    except HttpError as exc:
-        logger.error("search.list (channel) failed for '%s': %s", keyword, exc)
+    except QuotaExceededError:
+        raise
+    except Exception as exc:
+        handle_api_error(exc, f"search.list (channel) '{keyword}'")
 
     # Стратегия 2: Поиск через видео — находит маленьких авторов по контенту
     try:
@@ -367,8 +520,10 @@ def search_channels(youtube, keyword: str, max_results: int = SEARCH_RESULTS_PER
             if cid and cid not in seen_cids:
                 seen_cids.add(cid)
                 found.append({"channel_id": cid, "channel_name": item["snippet"].get("channelTitle")})
-    except HttpError as exc:
-        logger.error("search.list (video) failed for '%s': %s", keyword, exc)
+    except QuotaExceededError:
+        raise
+    except Exception as exc:
+        handle_api_error(exc, f"search.list (video) '{keyword}'")
 
     return found
 
@@ -382,8 +537,10 @@ def get_channel_details(youtube, channel_ids: list) -> dict:
                 part="snippet,statistics,contentDetails",
                 id=",".join(chunk),
             ).execute()
-        except HttpError as exc:
-            logger.error("channels.list failed: %s", exc)
+        except QuotaExceededError:
+            raise
+        except Exception as exc:
+            handle_api_error(exc, "channels.list")
             continue
         for item in resp.get("items", []):
             stats = item.get("statistics", {})
@@ -416,8 +573,10 @@ def get_recent_video_ids(youtube, uploads_playlist: str, max_results: int = RECE
             playlistId=uploads_playlist,
             maxResults=min(max_results, 50),
         ).execute()
-    except HttpError as exc:
-        logger.error("playlistItems.list failed: %s", exc)
+    except QuotaExceededError:
+        raise
+    except Exception as exc:
+        handle_api_error(exc, "playlistItems.list")
         return []
     return [
         it["contentDetails"]["videoId"]
@@ -434,14 +593,17 @@ def get_video_metadata(youtube, video_ids: list) -> list:
         chunk = video_ids[i:i + 50]
         try:
             resp = youtube.videos().list(
-                part="snippet,contentDetails",
+                part="snippet,contentDetails,statistics",
                 id=",".join(chunk),
             ).execute()
-        except HttpError as exc:
-            logger.error("videos.list failed: %s", exc)
+        except QuotaExceededError:
+            raise
+        except Exception as exc:
+            handle_api_error(exc, "videos.list")
             continue
         for item in resp.get("items", []):
             snip = item.get("snippet", {})
+            stats = item.get("statistics", {})
             thumbs = snip.get("thumbnails", {})
             thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default", {}))).get("url")
             out.append({
@@ -453,6 +615,7 @@ def get_video_metadata(youtube, video_ids: list) -> list:
                     item.get("contentDetails", {}).get("duration", "")
                 ),
                 "thumbnail_url": thumb_url,
+                "view_count": int(stats.get("viewCount", 0)),
             })
     return out
 
@@ -464,9 +627,12 @@ def is_latin_only(text: str) -> bool:
     return not NON_LATIN_REGEX.search(text or "")
 
 
-def hits_strict_blacklist(*texts: str) -> bool:
+def hits_strict_blacklist(*texts: str) -> str | None:
     blob = " ".join(t.lower() for t in texts if t)
-    return any(word in blob for word in STRICT_BLACKLIST)
+    for word in STRICT_BLACKLIST:
+        if word in blob:
+            return word
+    return None
 
 
 def has_stream_tokens(title: str) -> bool:
@@ -517,86 +683,196 @@ def extract_contacts_deep(channel_description: str, video_descriptions: list, ma
 
 
 # ==========================================================================
-# VISION AI: Скоринг thumbnail через Groq Vision
+# VISION AI: Scoring thumbnail via Hugging Face Inference API
 # ==========================================================================
-def score_thumbnail_vision(thumbnail_url: str) -> tuple:
+def score_lead_multimodal(thumbnail_url: str, title: str, description: str, channel_about: str) -> tuple:
     """
-    Анализирует thumbnail через Groq Vision API (llama-3.2-90b-vision-preview).
-    Возвращает (passed: bool, reason: str).
-    Если API недоступен или ошибка — возвращает (True, "vision_skip") чтобы не блокировать.
+    Analyzes lead via Hugging Face Router API using google/gemma-4-31B-it.
     """
-    if not thumbnail_url:
-        return False, "no_thumbnail_url"
+    if not HF_TOKEN:
+        logger.warning("HF_TOKEN missing, skipping vision scoring")
+        return False, "vision_no_hf_token"
 
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY missing, skipping vision scoring")
-        return True, "vision_skip_no_key"
+    model_id = "google/gemma-4-31B-it"
+    api_url = "https://router.huggingface.co/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        # Prepare the prompt
+        prompt_text = f"""You are a strict lead validator for a premium video agency. Your goal is to find INDIVIDUAL tech creators (founders, software engineers, solo-developers, tech experts) who talk about business, coding, SaaS, or digital products.
 
+Analyze BOTH the provided thumbnail image and the text context (Title, Description, About) to make a decision.
+
+CONTEXT:
+- Video Title: {title}
+- Video Description: {description[:500]}
+- Channel About: {channel_about[:500]}
+
+REJECT IMMEDIATELY IF:
+- The channel belongs to a corporate brand, company, or software tool (like Riverside, HubSpot, Zoom, etc.).
+- The channel is about tech reviews, gadgets, microphones, hardware, or gaming.
+- There is no real human face on the thumbnail.
+
+Respond in strict JSON:
+{{
+  "decision": "PASSED" or "FAILED",
+  "reason": "short explanation why"
+}}"""
+
+        # Hugging Face Router API Multimodal Payload (OpenAI-compatible)
         payload = {
-            "model": "llama-3.2-90b-vision-preview",
+            "model": model_id,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": VISION_SCORING_PROMPT},
                         {
                             "type": "image_url",
-                            "image_url": {"url": thumbnail_url},
+                            "image_url": {
+                                "url": thumbnail_url
+                            }
                         },
-                    ],
+                        {
+                            "type": "text",
+                            "text": prompt_text
+                        }
+                    ]
                 }
             ],
-            "temperature": 0.1,
-            "max_tokens": 200,
+            "parameters": {
+                "max_new_tokens": 512,
+                "temperature": 0.1,
+                "thinking": True,
+                "vision_token_budget": 560
+            }
         }
 
-        resp = httpx.post(
-            f"{GROQ_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30.0,
-        )
+        response = httpx.post(api_url, headers=headers, json=payload, timeout=60.0)
+        
+        if response.status_code != 200:
+            logger.error("HF API Error %d: %s", response.status_code, response.text)
+            # 402 (payment), 429 (rate limit), 5xx (server) = temporary, retry later
+            if response.status_code in (402, 429) or response.status_code >= 500:
+                return None, f"pending_error_hf_api_{response.status_code}"
+            return False, f"hf_api_error_{response.status_code}"
 
-        if resp.status_code != 200:
-            logger.warning("Vision API returned %d: %s", resp.status_code, resp.text[:200])
-            return True, "vision_api_error"
+        resp_json = response.json()
+        
+        # Extract content from choices (OpenAI-compatible format)
+        if "choices" in resp_json and len(resp_json["choices"]) > 0:
+            content = resp_json["choices"][0]["message"]["content"]
+        else:
+            logger.error("Unexpected HF API response format: %s", resp_json)
+            return False, "vision_bad_response_format"
 
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
+        # Remove thinking block if present
+        if "<|channel>thought" in content:
+            content = content.split("<channel|>")[-1].strip()
 
-        # Парсим JSON из ответа
+        # Clean JSON from markdown if needed
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+
         import json
-        # Ищем JSON в ответе (может быть обёрнут в markdown)
-        json_match = re.search(r'\{[^}]+\}', content)
-        if not json_match:
-            logger.warning("Vision: no JSON in response: %s", content[:100])
-            return True, "vision_parse_error"
-
-        result = json.loads(json_match.group(0))
-        passed = result.get("pass", False)
-        confidence = result.get("confidence", 0)
-        reason = result.get("reason", "unknown")
-
-        logger.info(
-            "Vision score: pass=%s, confidence=%d, reason='%s'",
-            passed, confidence, reason,
-        )
-
-        # Дополнительный порог уверенности: если pass=True но confidence < 70, дропаем
-        if passed and confidence < 70:
-            return False, f"vision_low_confidence_{confidence}: {reason}"
-
+        try:
+            result = json.loads(content)
+        except Exception as json_e:
+            logger.error("Failed to parse Vision AI JSON: %s | Content: %s", json_e, content)
+            return False, f"vision_json_error: {str(json_e)}"
+        
+        passed = str(result.get("decision", "")).upper() == "PASSED"
+        reason = result.get("reason") or "unknown"
         return passed, reason
 
     except Exception as e:
-        logger.warning("Vision scoring failed: %s", e)
-        return True, "vision_exception"
+        logger.warning("Gemma 4 Vision via HF failed: %s", e)
+        if "quota" in str(e).lower() or "limit" in str(e).lower():
+            return None, f"pending_error_vision_quota: {str(e)}"
+        return False, f"vision_api_error: {str(e)}"
+
+# ==========================================================================
+# CONTENT & PRODUCT ANALYSIS
+# ==========================================================================
+def analyze_content_and_product(youtube, channel_id: str, description: str, video_metas: list):
+    """
+    Analyzes channel content (long-form vs shorts) and extracts product info.
+    """
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
+    
+    long_form_count = 0
+    shorts_count = 0
+    long_form_views = 0
+    shorts_views = 0
+    
+    for v in video_metas:
+        pub_at = v.get("published_at")
+        if not pub_at: continue
+        pub_dt = datetime.fromisoformat(pub_at.replace("Z", "+00:00"))
+        
+        if pub_dt >= cutoff_date:
+            duration = v.get("duration_seconds", 0)
+            views = v.get("view_count", 0)
+            
+            if 0 < duration <= SHORT_MAX_SECONDS:
+                shorts_count += 1
+                shorts_views += views
+            elif duration > SHORT_MAX_SECONDS:
+                long_form_count += 1
+                long_form_views += views
+                
+    # Extract product name using LLM
+    product_name = "None"
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        extract_prompt = f"""Extract the name of the main product, SaaS, app, or course mentioned in this YouTube channel description. 
+If no clear product is mentioned, respond with 'None'. Respond with ONLY the name.
+
+DESCRIPTION:
+{description[:1500]}"""
+        
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": extract_prompt}],
+            temperature=0,
+            max_tokens=20
+        )
+        product_name = completion.choices[0].message.content.strip().strip('"')
+    except Exception as e:
+        logger.warning("Product extraction failed: %s", e)
+
+    # Views Gap Logic
+    avg_lf = long_form_views / long_form_count if long_form_count > 0 else 0
+    avg_sh = shorts_views / shorts_count if shorts_count > 0 else 0
+    
+    if long_form_count > 2 and shorts_count > 0:
+        if avg_sh < avg_lf * 0.2:
+            views_gap = "shorts lagging (much lower views than long-form)"
+        elif avg_lf > 5000 and shorts_count < 2:
+            views_gap = "long-form is high but shorts are rare"
+        else:
+            views_gap = "normal"
+    else:
+        views_gap = "normal"
+
+    return {
+        "long_form_count": long_form_count,
+        "shorts_count": shorts_count,
+        "product_name": product_name,
+        "views_gap": views_gap
+    }
+
+def is_english_strict(ch: dict, latest: dict) -> bool:
+    """Strict English language check."""
+    text = (ch.get("channel_name") or "") + " " + (ch.get("description") or "") + " " + (latest.get("title") or "")
+    if NON_LATIN_REGEX.search(text):
+        return False
+    if has_non_english_title_words(text):
+        return False
+    return True
 
 
 # ==========================================================================
@@ -628,7 +904,129 @@ def scan_and_enqueue(youtube, keywords: list, db_path: str = APEX_DB) -> int:
 #   STEP 5: Vision AI скоринг thumbnail (1 Groq API call — САМЫЙ дорогой)
 #   STEP 6: Поиск контактов + OSINT (опционально дорого)
 # ==========================================================================
-def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
+
+# ==========================================================================
+# VIDEO ENRICHMENT: free captions + metadata + AI summary
+# ==========================================================================
+def fetch_video_captions(video_id: str, max_chars: int = 3000) -> str | None:
+    """Fetch auto-generated or manual captions for free via youtube-transcript-api.
+    Returns transcript text (truncated to max_chars) or None."""
+    if not HAS_TRANSCRIPT_API:
+        return None
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
+        text_parts = [snippet.text for snippet in transcript.snippets]
+        full_text = " ".join(text_parts)
+        return full_text[:max_chars] if full_text else None
+    except Exception as e:
+        logger.debug("Captions not available for %s: %s", video_id, type(e).__name__)
+        return None
+
+
+def generate_video_summary(title: str, description: str, captions: str | None,
+                           views: int, duration_sec: int) -> dict:
+    """Generate a short summary + hooks using Groq Llama (cheap).
+    Returns dict with 'summary', 'hooks', 'has_captions'."""
+    has_captions = bool(captions)
+
+    # Build context
+    desc_short = (description or "")[:500]
+    duration_min = round(duration_sec / 60, 1) if duration_sec else 0
+
+    if captions:
+        context = f"Title: {title}\nDescription: {desc_short}\nViews: {views:,}\nDuration: {duration_min} min\n\nTranscript (first ~3000 chars):\n{captions}"
+    else:
+        context = f"Title: {title}\nDescription: {desc_short}\nViews: {views:,}\nDuration: {duration_min} min\n\n(No transcript available — summarize based on title and description only)"
+
+    prompt = (
+        "Analyze this YouTube video and provide a JSON response:\n"
+        "1. summary: 1-2 sentence summary of what the video is about\n"
+        "2. hooks: array of 1-3 potential short-form moments/hooks that could be clipped\n"
+        "3. outreach_angle: 1 sentence on how to reference this video in a cold outreach message\n\n"
+        "IMPORTANT: Only state facts from the provided data. If no transcript, keep it neutral.\n"
+        "Respond in valid JSON only: {\"summary\": \"...\", \"hooks\": [\"...\"], \"outreach_angle\": \"...\"}\n\n"
+        f"{context}"
+    )
+
+    try:
+        import os
+        from groq import Groq
+        groq_key = os.getenv("GROQ_API_KEY")
+        if not groq_key:
+            return {"summary": f"Video: {title}", "hooks": [], "outreach_angle": "", "has_captions": has_captions}
+
+        client = Groq(api_key=groq_key)
+        resp = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=300,
+        )
+        content = resp.choices[0].message.content.strip()
+
+        import json
+        # Extract JSON from response
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            result["has_captions"] = has_captions
+            return result
+    except Exception as e:
+        logger.warning("Video summary generation failed: %s", e)
+
+    # Fallback: neutral summary from title
+    return {
+        "summary": f"Video: {title}" if title else "No video data available",
+        "hooks": [],
+        "outreach_angle": "",
+        "has_captions": has_captions,
+    }
+
+
+def enrich_lead_video(lead: dict) -> dict:
+    """Enrichment step for validated leads. Adds video metadata + captions + summary.
+    Free: captions via youtube-transcript-api, summary via Groq Llama 3.1 8B (cheap).
+    Called only for leads that passed all filters."""
+    video_id = lead.get("latest_video_id")
+    if not video_id:
+        lead["video_enrichment"] = {"summary": "No video ID", "hooks": [], "outreach_angle": "", "has_captions": False}
+        return lead
+
+    logger.info("Enriching video for '%s' (video=%s)", lead.get("channel_name"), video_id)
+
+    # 1. Fetch free captions
+    captions = fetch_video_captions(video_id)
+    if captions:
+        logger.info("Captions found for '%s' (%d chars)", lead.get("channel_name"), len(captions))
+    else:
+        logger.info("No captions for '%s', using title+description fallback", lead.get("channel_name"))
+
+    # 2. Generate summary + hooks
+    enrichment = generate_video_summary(
+        title=lead.get("latest_video_title", ""),
+        description=lead.get("description", ""),
+        captions=captions,
+        views=lead.get("video_views", 0),
+        duration_sec=lead.get("video_duration", 0),
+    )
+
+    lead["video_enrichment"] = enrichment
+    lead["video_summary"] = enrichment.get("summary", "")
+    lead["video_hooks"] = enrichment.get("hooks", [])
+    lead["video_outreach_angle"] = enrichment.get("outreach_angle", "")
+    lead["video_has_captions"] = enrichment.get("has_captions", False)
+
+    logger.info("Enrichment done for '%s': summary=%s, hooks=%d, captions=%s",
+                lead.get("channel_name"),
+                lead["video_summary"][:60],
+                len(lead["video_hooks"]),
+                lead["video_has_captions"])
+
+    return lead
+
+
+def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB, channel_detail: dict = None):
     """
     Каскадная валидация канала. Каждый шаг — гейт.
     Если канал не проходит — мгновенный дроп БЕЗ перехода к дорогим шагам.
@@ -637,9 +1035,13 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
 
     # ======================================================================
     # STEP 1: Подписчики (10k-100k) + Гео (US, GB, CA, AU, NZ, IE)
-    # Стоимость: 1 unit YouTube API (channels.list)
+    # Стоимость: 1 unit YouTube API (channels.list) - ИСПОЛЬЗУЕМ КЭШ ЕСЛИ ЕСТЬ
     # ======================================================================
-    ch = get_channel_details(youtube, [channel_id]).get(channel_id)
+    if channel_detail:
+        ch = channel_detail
+    else:
+        ch = get_channel_details(youtube, [channel_id]).get(channel_id)
+        
     if not ch:
         return None, "channel_not_found"
 
@@ -666,15 +1068,16 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
         return None, "step2_non_latin_name"
 
     description = ch.get("description", "")
-    if hits_strict_blacklist(name, description):
-        logger.info("STEP2 DROP '%s': hit strict blacklist", name)
-        return None, "step2_blacklist_hit"
+    blacklist_hit = hits_strict_blacklist(name, description)
+    if blacklist_hit:
+        logger.info("STEP2 DROP '%s': hit strict blacklist term=%s", name, blacklist_hit)
+        return None, f"step2_blacklist_hit:{blacklist_hit}"
 
     # ======================================================================
-    # STEP 3: Наличие Instagram или Twitter/X в метаданных
+    # STEP 3: Наличие Instagram или Twitter/X в метаданных (ОПЦИОНАЛЬНО)
     # Стоимость: 0 (парсим description из Step 1)
-    # Логика: премиум соло-авторы ВСЕГДА качают личный бренд через Инсту/X.
-    #         Если ссылок нет — это НЕ наш клиент.
+    # Логика: премиум соло-авторы часто качают личный бренд через Инсту/X.
+    #         Теперь это не блокирующий фильтр, а просто пометка.
     # ======================================================================
     _, socials_from_desc = extract_contacts(description)
     visual_socials = [
@@ -682,74 +1085,62 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
         if any(domain in s.lower() for domain in VISUAL_SOCIAL_DOMAINS)
     ]
 
-    if not visual_socials:
-        logger.info("STEP3 DROP '%s': no Instagram/Twitter/X in channel description", name)
-        return None, "step3_no_visual_socials"
+    # if not visual_socials:
+    #     logger.info("STEP3 DROP '%s': no Instagram/Twitter/X in channel description", name)
+    #     return None, "step3_no_visual_socials"
 
     # ======================================================================
-    # STEP 4: Длина видео — строго от 5 до 25 минут (последние 3 видео)
-    # Стоимость: 2 units YouTube API (playlistItems.list + videos.list)
-    # Логика: качественные Talking Head авторы записывают 8-20 мин контент.
-    #         < 5 мин = шортсы/нарезки, > 25 мин = стримы/подкасты/лекции.
+    # STEP 4: Длина видео + Свежесть (30 дней) + English Filter
     # ======================================================================
-    video_ids = get_recent_video_ids(youtube, ch["uploads_playlist"], max_results=10)
+    video_ids = get_recent_video_ids(youtube, ch["uploads_playlist"], max_results=RECENT_VIDEOS_TO_CHECK)
     metas = get_video_metadata(youtube, video_ids)
     if not metas:
         return None, "step4_no_recent_videos"
 
     metas.sort(key=lambda m: m.get("published_at") or "", reverse=True)
-
-    # Берём последние 3 видео для проверки длины
-    last_3 = metas[:3]
-    for vid in last_3:
-        dur = vid["duration_seconds"]
-        if dur < MIN_VIDEO_SECONDS or dur > MAX_VIDEO_SECONDS:
-            logger.info(
-                "STEP4 DROP '%s': video '%s' duration=%ds (need %d-%d)",
-                name, vid["title"][:40], dur, MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS,
-            )
-            return None, f"step4_duration_{dur}s"
-
-    # Дополнительно: проверяем заголовки на стримы/скриншеры/не-англ.
     latest = metas[0]
-    latest_title = latest["title"]
+    
+    # Recency Check: 30 days
+    pub_at = latest.get("published_at")
+    if pub_at:
+        pub_dt = datetime.fromisoformat(pub_at.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) - pub_dt > timedelta(days=30):
+            logger.info("STEP4 DROP '%s': inactive (>30 days)", name)
+            return None, "step4_inactive_channel"
 
-    if hits_strict_blacklist(latest_title):
-        return None, "step4_title_blacklist"
-    if has_stream_tokens(latest_title):
-        return None, "step4_stream_tokens"
-    if has_screenshare_markers(latest_title):
-        return None, "step4_screenshare_markers"
-    if has_non_english_title_words(latest_title):
-        return None, "step4_non_english_title"
+    # English check (STRICT)
+    if not is_english_strict(ch, latest):
+        logger.info("STEP4 DROP '%s': non-english", name)
+        return None, "step4_non_english"
 
-    # Считаем недавние шортсы
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RECENT_WINDOW_DAYS)
-    recent_shorts = 0
-    for m in metas:
-        pub = m.get("published_at")
-        try:
-            pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00")) if pub else None
-        except ValueError:
-            pub_dt = None
-        if pub_dt and pub_dt >= cutoff and 0 < m["duration_seconds"] <= SHORT_MAX_SECONDS:
-            recent_shorts += 1
-    if recent_shorts > MAX_RECENT_SHORTS:
-        return None, "step4_already_does_shorts"
-
+    # Считаем недавние шортсы и другие метрики
+    analysis = analyze_content_and_product(youtube, channel_id, description, metas)
+    
     # ======================================================================
-    # STEP 5: Vision AI — скоринг thumbnail последнего видео
-    # Стоимость: 1 Groq Vision API call (самый дорогой шаг)
-    # Критерии: соло-спикер + дорогая студия + без экранов/графиков
+    # STEP 5: Vision AI — ОТКЛЮЧЁН (ручной просмотр вместо автоматического)
     # ======================================================================
     thumbnail_url = latest.get("thumbnail_url")
-    vision_passed, vision_reason = score_thumbnail_vision(thumbnail_url)
+    vision_reason = "vision_skipped"
+    logger.info("STEP5 SKIP '%s': Vision AI disabled, marking as vision_skipped", name)
 
-    if not vision_passed:
-        logger.info("STEP5 DROP '%s': Vision AI rejected — %s", name, vision_reason)
-        return None, f"step5_vision_fail: {vision_reason}"
+    # ======================================================================
+    # STEP 5b: Обязательный продукт — без продукта лид не нужен
+    # ======================================================================
+    product_name = analysis.get("product_name", "None")
+    if not product_name or product_name.lower() in ("none", "", "null"):
+        logger.info("STEP5b DROP '%s': no product/SaaS detected", name)
+        return None, "step5b_no_product"
 
-    logger.info("STEP5 PASS '%s': Vision AI approved — %s", name, vision_reason)
+    # Классификация short-form opportunity
+    shorts_count = analysis.get("shorts_count", 0)
+    if shorts_count <= 1:
+        shorts_opportunity = "no_shorts"
+    elif shorts_count <= 3:
+        shorts_opportunity = "inconsistent_shorts"
+    else:
+        shorts_opportunity = "weak_editing_shorts"
+    analysis["shorts_opportunity"] = shorts_opportunity
+    logger.info("STEP5b PASS '%s': product='%s' shorts_opportunity='%s'", name, product_name, shorts_opportunity)
 
     # ======================================================================
     # STEP 6: Глубокий поиск контактов + OSINT
@@ -778,6 +1169,17 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
             email = None
 
     # ======================================================================
+    # STEP 7: Usable contact check — email / X / Instagram / website
+    # ======================================================================
+    contact_info = classify_contact_channels(email, all_socials)
+    has_contact = bool(email) or bool(contact_info.get("x_url")) or bool(contact_info.get("instagram_url")) or bool(contact_info.get("website_url"))
+    if not has_contact:
+        logger.info("STEP7 DROP '%s': no usable contact (no email, X, Instagram, or website)", name)
+        return None, "step_contact_missing"
+
+    logger.info("STEP7 PASS '%s': contact found (preferred=%s)", name, contact_info.get("preferred_channel", "none"))
+
+    # ======================================================================
     # РЕЗУЛЬТАТ: Канал прошёл ВСЕ гейты — формируем lead dict
     # ======================================================================
     lead = {
@@ -788,15 +1190,24 @@ def validate_lead(youtube, channel_id: str, db_path: str = APEX_DB):
         "contact_email": email,
         "social_links": all_socials,
         "subscriber_count": subs,
-        "recent_shorts": recent_shorts,
-        "latest_video_title": latest_title,
+        "long_form_count": analysis["long_form_count"],
+        "shorts_count": analysis["shorts_count"],
+        "shorts_opportunity": analysis.get("shorts_opportunity", "unknown"),
+        "product_name": analysis["product_name"],
+        "views_gap": analysis["views_gap"],
+        "latest_video_title": latest["title"],
         "latest_video_id": latest["video_id"],
         "thumbnail_url": thumbnail_url,
+        "video_views": latest.get("view_count", 0),
+        "video_published_at": latest.get("published_at", ""),
+        "video_duration": latest.get("duration_seconds", 0),
+        "video_description": latest.get("description", "")[:500],
         "vision_score": vision_reason,
     }
+    lead.update(contact_info)
 
     logger.info(
-        "✅ VALIDATED '%s' | subs=%d | country=%s | socials=%d | email=%s",
-        name, subs, country or "N/A", len(visual_socials), bool(email),
+        "✅ VALIDATED '%s' | subs=%d | country=%s | socials=%d | email=%s | preferred=%s",
+        name, subs, country or "N/A", len(visual_socials), bool(email), lead.get("preferred_channel"),
     )
     return lead, None
