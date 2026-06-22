@@ -1,0 +1,7 @@
+.env
+agency.db
+agency.db-wal
+agency.db-shm
+venv/
+__pycache__/
+*.pyc
